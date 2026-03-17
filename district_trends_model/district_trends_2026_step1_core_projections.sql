@@ -1,5 +1,8 @@
 /*
-  trends_2025_district_step2_core_2030_model
+  district_trends_2026_step1
+  v1.0
+  adapted from
+trends_2025_district_step2_core_2030_model
   v1.2
   adapted from trends_2025_step2_core_2030_model v55.0
 
