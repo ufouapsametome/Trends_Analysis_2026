@@ -1,12 +1,13 @@
 /*
   district_trends_2026_step3_analytics
-  v1.0
+  v2.1
+  adapted from
   trends_2025_district_step5_analytics
   v1.4
   adapted from trends_2025_step5_district_analytics
 
   Builds the deep analytics profile for every legislative district. Serves as
-  the intermediate table powering Step 6 explanation generation.
+  the intermediate table powering Step 4 explanation generation.
 
   Computes per-district: position metrics (margin/rank distance to median across
   all scenarios), volatility, trend alignment, demographic driver ranking
@@ -31,10 +32,10 @@
     - Joined in final assembly (Section 9).
 
   Inputs:
-    core_model_outputs_hd/_sd          (Step 2)
-    combined_dem_baseline_hd/_sd       (Step 1b)
-    weighted_demo_shares_hd/_sd        (Step 2)
-    tipping_point_analysis             (Step 3+4, combined)
+    core_model_outputs_hd/_sd          (Step 1)
+    combined_dem_baseline_hd/_sd       (Preliminary)
+    weighted_demo_shares_hd/_sd        (Step 1)
+    tipping_point_analysis             (Step 2)
     trends_2026_scenarios              (scenario table)
     NH district/floterial xrefs
     TargetSmart voter file             (for raw demographic profiles + urbanicity)
@@ -44,11 +45,11 @@
 */
 
 -- CONFIGURATION
-DECLARE execution_mode STRING DEFAULT 'TABLE'; --<-- 'SELECT' for diagnostics, 'TABLE' for prod
+DECLARE execution_mode STRING DEFAULT 'SELECT'; --<-- 'SELECT' for diagnostics, 'TABLE' for prod
 DECLARE output_table STRING DEFAULT 'proj-tmc-mem-fm.main.trends_2025_district_analytics';
 DECLARE baseline_vote_choice_scenario STRING DEFAULT 'balanced_Baseline';
 
-DECLARE diagnostic_mode BOOL DEFAULT FALSE; --<--TRUE for diagnostics
+DECLARE diagnostic_mode BOOL DEFAULT TRUE; --<--TRUE for diagnostics
 DECLARE target_states ARRAY<STRING> DEFAULT [
 'AK','AZ','FL','GA','IA','KS','ME','MI','MN','NC','NH','NV','OH','PA','TX','VA','WI'
 ];
@@ -97,16 +98,16 @@ WITH
 -- 0. SOURCE UNIONS
 -- =====================================================================
 
--- MODEL OUTPUTS: UNION core model outputs from Step 2 (still separate tables)
+-- MODEL OUTPUTS: UNION core model outputs from Step 1 (still separate tables)
 core_model_union AS (
   SELECT *, 'hd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_core_model_outputs_hd`
   UNION ALL
   SELECT *, 'sd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_core_model_outputs_sd`
 ),
 
--- BASELINES: Load from Step 1b and synthesize NH floterial baselines.
--- Previously this join was done in Step 3 and materialized as weighted_model_outputs.
--- Now inlined here since the merged Step 3+4 no longer materializes that intermediate.
+-- BASELINES: Load from preliminary Dem baseline query and synthesize NH floterial baselines.
+-- Previously this join was done in a separate query and materialized as weighted_model_outputs.
+-- Now inlined here since Step 2 no longer materializes that intermediate.
 standard_baselines_raw_hd AS (
   SELECT * FROM `proj-tmc-mem-fm.main.trends_2025_combined_dem_baseline_hd`
 ),
@@ -186,7 +187,7 @@ weighted_union AS (
   WHERE m.vote_choice_scenario != 'present_day_baseline'
 ),
 
--- TIPPING UNION: reads directly from merged Step 3+4 combined output.
+-- TIPPING UNION: reads directly from Step 2 output.
 -- Previously UNION'd _hd + _sd with column aliasing.
 tipping_union AS (
   SELECT
@@ -209,7 +210,7 @@ tipping_union AS (
   FROM `proj-tmc-mem-fm.main.trends_2025_tipping_point_analysis`
 ),
 
--- WEIGHTED DEMOGRAPHICS: still separate tables from Step 2
+-- WEIGHTED DEMOGRAPHICS: still separate tables from Step 1
 weighted_demo_union AS (
   SELECT *, 'hd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_weighted_demo_shares_hd`
   UNION ALL
@@ -445,7 +446,7 @@ state_competitive_counts AS (
 -- =====================================================================
 
 -- Re-reads the voter file independently from Step 2 for raw demographic shares.
--- Applies the same ACS natam correction and age imputation as Step 2.
+-- Applies the same ACS natam correction and age imputation as Step 1.
 -- [v1.4] Now also reads ts_tsmart_urbanicity for district urbanicity classification.
 voter_base AS (
   SELECT
@@ -503,7 +504,7 @@ voter_base AS (
     AND v.vb_vf_hd IS NOT NULL
 ),
 
--- ACS-calibrated NatAm correction (mirrors Step 2)
+-- ACS-calibrated NatAm correction (mirrors Step 1)
 voter_base_corrected AS (
   SELECT vb.*,
     LEAST(GREATEST(vb.ts_tsmr_p_natam, 0), 1)
@@ -744,7 +745,7 @@ scenario_lever_ranges AS (
   FROM `proj-tmc-mem-fm.main.trends_2026_scenarios`
 ),
 
--- Weighted state averages for benchmarking (uses turnout-weighted shares from Step 2)
+-- Weighted state averages for benchmarking (uses turnout-weighted shares from Step 1)
 state_weighted_averages AS (
   SELECT
     state, chamber,
@@ -1194,7 +1195,7 @@ assembled AS (
     (tp.baseline_projected_share -
       dp.projected_2030_baseline_margin_to_median) AS chamber_median_dem_share_2030,
 
-    -- Tipping raw counts (for Step 6 reliability assessment)
+    -- Tipping raw counts (for Step 4 reliability assessment)
     tp.favorable_tipping_scenario_count,
     tp.unfavorable_tipping_scenario_count,
     tp.total_favorable_combos,
@@ -1333,4 +1334,4 @@ END IF;
 
 END;
 
--- END STEP 5
+-- END STEP 3
