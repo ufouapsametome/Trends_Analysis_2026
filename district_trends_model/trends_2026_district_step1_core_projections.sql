@@ -1,9 +1,9 @@
 /*
   district_trends_2026_step1
-  v1.0
+  v60.2
   adapted from
-trends_2025_district_step2_core_2030_model
-  v1.2
+  trends_2025_district_step2_core_2030_model
+  v1.3-EV
   adapted from trends_2025_step2_core_2030_model v55.0
 
   MUST BE RUN TWICE: ONCE EACH FOR HD/SD
@@ -17,7 +17,34 @@ trends_2025_district_step2_core_2030_model
            ACS NatAm correction, age imputation thresholds, CDC race mortality rates,
            scenario table, state FIPS codes,
            NH district/floterial xrefs, combined_dem_baseline_[hd|sd]
+
   Outputs: core_model_outputs_[hd|sd], weighted_demo_shares_[hd|sd]
+
+  v1.3-EV CHANGES (from v1.1):
+  [EV #1] Expected-value null-age handling: For voters with imputed ages
+           (age_source = 'imputed'), all weight-bearing calculations (mortality,
+           migration stability, maturation, mover factor, stability floors) now use
+           probability-weighted expected values across the county's ACS age
+           distribution, instead of the single hash-assigned age. This eliminates
+           individual-level variance while preserving county-level aggregate accuracy.
+           The hash-imputed effective_age is retained for downstream CTEs and downstream demographic aggregation
+           (weighted_demo_shares). Age flags (age_18_24_flag etc.) are now fractional
+           (weighted_demo_shares). Age flags (age_18_24_flag etc.) are now fractional
+           for imputed voters, reflecting county ACS probabilities rather than binary
+           hash-assigned bands. This means weighted_demo_shares age composition for
+           AK/NH/WI districts uses EV-smoothed age shares. Voter-file-age districts
+           are unaffected.
+
+           Three new CTEs: county_age_probs, county_expected_mortality,
+           county_expected_stability. Six modified CTEs: with_flags, with_mortality,
+           with_migration, weighted_prep, weighted.
+
+           Voter-file-age pathway is completely unchanged.
+
+           Secondary effect: district_profile pct_voters_18_24 (used for college-town
+           detection) now receives fractional age flags for imputed voters. Practical
+           impact is negligible — college-town detection primarily matters in states
+           with known ages (PA, OH, MI), not in AK/NH/WI.
 
   v1.1 CHANGES (from v1.0):
   [IMP #1] Race-differentiated mortality: Replaced hardcoded pooled mortality CASE
@@ -26,11 +53,13 @@ trends_2025_district_step2_core_2030_model
            probability-weighted blend across 4 race groups × 8 age bands × 3 sex
            categories. Ported from state model Step 1 v2.0.
            JOIN uses LOWER() on age_band() output to resolve 85_PLUS/85_plus mismatch.
+
   [IMP #2] Age imputation thresholds: Swapped trends_2025_age_imputation_weights
            (youth-skewed, built from interstate-mover subpopulation) with
            trends_2025_age_imputation_thresholds (built from ACS total_pop with
            registered-voter reweighting). Fixes ~40% youth overassignment in NH/WI.
            Ported from state model Step 1 v2.6.
+
   [IMP #3] Maturation IFNULL safety: Changed IFNULL defaults from 1.0 to 0.0 for
            missing ACS maturation factors. Conservative: assumes no new registrants
            rather than neutral replacement when county data is missing.
@@ -40,14 +69,14 @@ trends_2025_district_step2_core_2030_model
 -- TOGGLES
 DECLARE diagnostic_mode BOOL DEFAULT FALSE;              -- TRUE FOR DIAGNOSTICS: only balanced_Baseline @ swing 0
 DECLARE make_table_mode BOOL DEFAULT TRUE;               -- FALSE FOR DIAGNOSTICS: SELECT to console instead of writing table
-DECLARE export_weighted_demographics BOOL DEFAULT TRUE;  -- Writes weighted_demo_shares, required by Step 5
+DECLARE export_weighted_demographics BOOL DEFAULT TRUE;  -- Writes weighted_demo_shares, required by Step 3
 
 -- CONFIGURATION
 DECLARE target_states ARRAY<STRING> DEFAULT
 ['AK','AZ','FL','GA','IA','KS','ME','MI','MN','NC','NH','NV','OH','PA','TX','VA','WI'];
 --['GA','OH']; <--SET DIAGNOSTIC STATES
 
-DECLARE target_district_level STRING DEFAULT 'SD'; -- 'HD' or 'SD'
+DECLARE target_district_level STRING DEFAULT 'HD'; -- 'HD' or 'SD'
 
 -- Uniform swings as integer percentage points (e.g., -6 = 6 pts against Dems).
 -- Stored as INT64 through pipeline output; divide by 100 only at display time
@@ -158,7 +187,6 @@ CREATE TEMP TABLE _weighted_voters AS
 WITH
 
   base_filtered AS (
-
     SELECT
       v.vb_voterbase_id,
       v.vb_tsmart_state AS state,
@@ -210,6 +238,7 @@ WITH
       v.vb_voterbase_mover_status,
       v.vb_voterbase_move_distance,
       v.vb_vf_county_code,
+      v.vb_tsmart_county_code,
       v.ts_tsmart_partisan_score,
       v.ts_tsmart_presidential_general_turnout_score,
       v.ts_tsmart_midterm_general_turnout_score,
@@ -222,7 +251,6 @@ WITH
       v.ts_tsmr_p_hisp,
       v.ts_tsmr_p_natam,
       v.ts_tsmr_p_asian,
-      v.vb_tsmart_county_code,
 
       CONCAT(
         '0500000US',
@@ -230,9 +258,6 @@ WITH
         LPAD(CAST(v.vb_tsmart_county_code AS STRING), 3, '0')
       ) AS county_geo_id,
 
-      -- NatAm ACS correction: deflates TargetSmart residual bucket to genuine
-      -- Native American share using county-level ACS ground truth. Counties below
-      -- 2% ACS Native share are suppressed to 0.0.
       COALESCE(nc.natam_correction_ratio, 0.0) AS natam_correction_ratio
 
     FROM
@@ -271,7 +296,64 @@ WITH
       AND v.vb_vf_sd IS NOT NULL
       AND v.vb_vf_hd IS NOT NULL
       AND (v.vb_voterbase_age >= 18 OR v.vb_voterbase_age IS NULL)
+      AND v.ts_tsmart_partisan_score IS NOT NULL
+  ),
 
+  -- ===========================================================================
+  -- [EV #1] NEW CTE: County-level age band probabilities
+  -- Converts cumulative imputation thresholds to per-band probabilities.
+  -- Used by with_flags, with_mortality, with_migration, weighted_prep, weighted
+  -- for expected-value calculations on imputed-age voters.
+  -- For non-null-age states, rows exist but are never consumed (age_source
+  -- branching takes the voter_file path).
+  -- ===========================================================================
+  county_age_probs AS (
+    SELECT
+      county_geo_id,
+      state,
+
+      -- 7 imputation-band probabilities
+      cum_18_24                            AS p_imp_18_24,
+      cum_25_34 - cum_18_24                AS p_imp_25_34,
+      cum_35_44 - cum_25_34                AS p_imp_35_44,
+      cum_45_54 - cum_35_44                AS p_imp_45_54,
+      cum_55_64 - cum_45_54                AS p_imp_55_64,
+      cum_65_74 - cum_55_64                AS p_imp_65_74,
+      1.0       - cum_65_74                AS p_imp_75_plus,
+
+      -- 8 CDC mortality-band probabilities
+      -- 75+ splits into 75_84 / 85+ proportional to hash range (10/15 vs 5/15)
+      cum_18_24                            AS p_mort_18_24,
+      cum_25_34 - cum_18_24                AS p_mort_25_34,
+      cum_35_44 - cum_25_34                AS p_mort_35_44,
+      cum_45_54 - cum_35_44                AS p_mort_45_54,
+      cum_55_64 - cum_45_54                AS p_mort_55_64,
+      cum_65_74 - cum_55_64                AS p_mort_65_74,
+      (1.0 - cum_65_74) * (10.0 / 15.0)   AS p_mort_75_84,
+      (1.0 - cum_65_74) * ( 5.0 / 15.0)   AS p_mort_85_plus,
+
+      -- 13 ACS stability-band probabilities (uniform within-band assumption)
+      cum_18_24 * (2.0 / 7.0)                       AS p_stab_18_19,
+      cum_18_24 * (5.0 / 7.0)                       AS p_stab_20_24,
+      (cum_25_34 - cum_18_24) * 0.5                  AS p_stab_25_29,
+      (cum_25_34 - cum_18_24) * 0.5                  AS p_stab_30_34,
+      (cum_35_44 - cum_25_34) * 0.5                  AS p_stab_35_39,
+      (cum_35_44 - cum_25_34) * 0.5                  AS p_stab_40_44,
+      (cum_45_54 - cum_35_44) * 0.5                  AS p_stab_45_49,
+      (cum_45_54 - cum_35_44) * 0.5                  AS p_stab_50_54,
+      (cum_55_64 - cum_45_54) * 0.5                  AS p_stab_55_59,
+      (cum_55_64 - cum_45_54) * 0.5                  AS p_stab_60_64,
+      (cum_65_74 - cum_55_64) * 0.5                  AS p_stab_65_69,
+      (cum_65_74 - cum_55_64) * 0.5                  AS p_stab_70_74,
+      1.0 - cum_65_74                                AS p_stab_75_plus,
+
+      -- P(age 18-22): 5/7 of the 18-24 band
+      cum_18_24 * (5.0 / 7.0)                       AS p_maturation_18_22,
+
+      -- P(under 25): entire 18-24 band
+      cum_18_24                                      AS p_under_25
+
+    FROM `proj-tmc-mem-fm.main.trends_2025_age_imputation_thresholds`
   ),
 
   nh_district_xref AS (
@@ -335,7 +417,6 @@ WITH
       vb_voterbase_move_distance,
       vb_vf_county_code,
       vb_tsmart_county_code,
-
       clamp01(ts_tsmart_partisan_score / 100.0) AS partisanship_prob,
       clamp01(ts_tsmart_presidential_general_turnout_score / 100.0) AS pres_turnout_prob,
       clamp01(ts_tsmart_midterm_general_turnout_score / 100.0) AS mid_turnout_prob,
@@ -343,39 +424,71 @@ WITH
       clamp01(ts_tsmart_high_school_only_score / 100.0) AS high_school_only_prob,
       clamp01(ts_tsmart_catholic_raw_score / 100.0) AS catholic_prob,
       clamp01(ts_tsmart_evangelical_raw_score / 100.0) AS evangelical_prob,
-
       clamp01(ts_tsmr_p_white) AS p_white,
       clamp01(ts_tsmr_p_black) AS p_black,
       clamp01(ts_tsmr_p_hisp) AS p_hisp,
       clamp01(ts_tsmr_p_natam) * natam_correction_ratio AS p_natam,
       clamp01(ts_tsmr_p_asian) AS p_asian
-
     FROM with_district_level
   ),
 
+  -- ===========================================================================
+  -- [EV #1] MODIFIED: with_flags
+  -- Age flags are now fractional for imputed-age voters. A voter with
+  -- age_source = 'imputed' gets the county's ACS probability for each band
+  -- instead of a binary 0/1. For voter-file-age voters, behavior is unchanged.
+  -- This propagates correctly into with_global_all (scenario deltas) and
+  -- Part 2 (per_voter_scenarios), where deltas multiply by age flags.
+  -- ===========================================================================
   with_flags AS (
     SELECT
-      *,
-      CASE WHEN effective_age BETWEEN 18 AND 24 THEN 1.0 ELSE 0.0 END AS age_18_24_flag,
-      CASE WHEN effective_age BETWEEN 25 AND 34 THEN 1.0 ELSE 0.0 END AS age_25_34_flag,
-      CASE WHEN effective_age BETWEEN 35 AND 44 THEN 1.0 ELSE 0.0 END AS age_35_44_flag,
-      CASE WHEN effective_age BETWEEN 45 AND 54 THEN 1.0 ELSE 0.0 END AS age_45_54_flag,
-      CASE WHEN effective_age BETWEEN 55 AND 64 THEN 1.0 ELSE 0.0 END AS age_55_64_flag,
-      CASE WHEN effective_age BETWEEN 65 AND 74 THEN 1.0 ELSE 0.0 END AS age_65_74_flag,
-      CASE WHEN effective_age BETWEEN 75 AND 84 THEN 1.0 ELSE 0.0 END AS age_75_84_flag,
-      CASE WHEN effective_age >= 85 THEN 1.0 ELSE 0.0 END AS age_85_plus_flag,
+      s.*,
 
-      CASE WHEN vb_voterbase_gender = 'Female' THEN 1.0 ELSE 0.0 END AS female_flag,
-      CASE WHEN vb_voterbase_gender = 'Male' THEN 1.0 ELSE 0.0 END AS male_flag,
+      -- [EV #1] Age flags: binary for voter_file, fractional for imputed
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 18 AND 24 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_imp_18_24, 0.0)
+      END AS age_18_24_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 25 AND 34 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_imp_25_34, 0.0)
+      END AS age_25_34_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 35 AND 44 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_imp_35_44, 0.0)
+      END AS age_35_44_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 45 AND 54 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_imp_45_54, 0.0)
+      END AS age_45_54_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 55 AND 64 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_imp_55_64, 0.0)
+      END AS age_55_64_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 65 AND 74 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_imp_65_74, 0.0)
+      END AS age_65_74_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age BETWEEN 75 AND 84 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_mort_75_84, 0.0)
+      END AS age_75_84_flag,
+      CASE WHEN s.age_source = 'voter_file'
+           THEN CASE WHEN s.effective_age >= 85 THEN 1.0 ELSE 0.0 END
+           ELSE COALESCE(cap.p_mort_85_plus, 0.0)
+      END AS age_85_plus_flag,
+
+      CASE WHEN s.vb_voterbase_gender = 'Female' THEN 1.0 ELSE 0.0 END AS female_flag,
+      CASE WHEN s.vb_voterbase_gender = 'Male' THEN 1.0 ELSE 0.0 END AS male_flag,
 
       CASE
-        WHEN vb_vf_earliest_registration_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 5 YEAR)
-          OR vb_tsmart_effective_date >= CAST(FORMAT_DATE('%Y%m', DATE_SUB(CURRENT_DATE(), INTERVAL 5 YEAR)) AS INT64)
+        WHEN s.vb_vf_earliest_registration_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 5 YEAR)
+          OR s.vb_tsmart_effective_date >= CAST(FORMAT_DATE('%Y%m', DATE_SUB(CURRENT_DATE(), INTERVAL 5 YEAR)) AS INT64)
         THEN 1.0
         ELSE 0.0
       END AS is_recent_activity,
 
-      (pres_turnout_prob + mid_turnout_prob) / 2.0 AS expected_individual_vote,
+      (s.pres_turnout_prob + s.mid_turnout_prob) / 2.0 AS expected_individual_vote,
 
       -- COMPOSITE IN-MOVER FLAG
       -- Classifies voters as "meaningful movers" who relocated from a
@@ -384,26 +497,28 @@ WITH
       -- Hierarchy: (1) TS confirmed cross-county/state, (2) within-county 5+ mi,
       -- (3) registration county != current county, (4) NCOA-confirmed + age 23+.
       CASE
-        WHEN vb_voterbase_mover_status IN (
+        WHEN s.vb_voterbase_mover_status IN (
           'Moved within State', 'Moved out of State', 'Moved Left No Address'
         ) THEN 1.0
-        WHEN vb_voterbase_mover_status = 'Moved within County'
-             AND vb_voterbase_move_distance >= 5 THEN 1.0
-        WHEN vb_vf_county_code IS NOT NULL
-             AND vb_tsmart_county_code IS NOT NULL
-             AND LPAD(CAST(vb_vf_county_code AS STRING), 3, '0')
-                 != LPAD(CAST(vb_tsmart_county_code AS STRING), 3, '0')
+        WHEN s.vb_voterbase_mover_status = 'Moved within County'
+             AND s.vb_voterbase_move_distance >= 5 THEN 1.0
+        WHEN s.vb_vf_county_code IS NOT NULL
+             AND s.vb_tsmart_county_code IS NOT NULL
+             AND LPAD(CAST(s.vb_vf_county_code AS STRING), 3, '0')
+                 != LPAD(CAST(s.vb_tsmart_county_code AS STRING), 3, '0')
         THEN 1.0
-        WHEN vb_tsmart_address_improvement_type IN (1, 2, 5, 6)
-             AND vb_tsmart_effective_date >= CAST(
+        WHEN s.vb_tsmart_address_improvement_type IN (1, 2, 5, 6)
+             AND s.vb_tsmart_effective_date >= CAST(
                FORMAT_DATE('%Y%m', DATE_SUB(CURRENT_DATE(), INTERVAL 5 YEAR))
                AS INT64)
-             AND effective_age >= 23
+             AND s.effective_age >= 23
         THEN 1.0
         ELSE 0.0
       END AS is_meaningful_mover
 
-    FROM scaled
+    FROM scaled s
+    -- [EV #1] Join county age probabilities for fractional age flags
+    LEFT JOIN county_age_probs cap ON cap.county_geo_id = s.county_geo_id
   ),
 
   -- STATE-LEVEL MOVER OFFSET (fallback prior)
@@ -461,7 +576,6 @@ WITH
           * COALESCE(s.state_mover_partisan_offset, 0.0)
         )
       ) AS mover_partisan_offset
-
     FROM (
       SELECT
         state,
@@ -483,6 +597,10 @@ WITH
   ),
 
   -- District-level profile for college-town detection
+  -- [EV #1] NOTE: pct_voters_18_24 now uses fractional age_18_24_flag for imputed
+  -- voters (~county ACS P(18-24) per voter, not binary 0/1 from hash-imputed age).
+  -- Impact is negligible: college-town detection thresholds matter in states with
+  -- known ages (PA, OH, MI), not in the 3 null-age states (AK, NH, WI).
   district_profile AS (
     SELECT
       state,
@@ -619,35 +737,188 @@ WITH
     GROUP BY mortality_age_band, gender
   ),
 
-  -- 5-year mortality: race-differentiated CDC rates scaled by healthy-voter effect
+  -- ===========================================================================
+  -- [EV #1] NEW CTE: Expected mortality per county × gender
+  -- Pre-computes the weighted-average mortality rate across all 8 CDC age bands
+  -- for a randomly-aged voter in each county. Only consumed by the imputed-age
+  -- path in with_mortality; voter-file-age voters use the single-band lookup.
+  -- ===========================================================================
+  county_expected_mortality AS (
+    SELECT
+      cap.county_geo_id,
+      mort.gender,
+      SUM(
+        CASE mort.mortality_age_band
+          WHEN '18_24'  THEN cap.p_mort_18_24
+          WHEN '25_34'  THEN cap.p_mort_25_34
+          WHEN '35_44'  THEN cap.p_mort_35_44
+          WHEN '45_54'  THEN cap.p_mort_45_54
+          WHEN '55_64'  THEN cap.p_mort_55_64
+          WHEN '65_74'  THEN cap.p_mort_65_74
+          WHEN '75_84'  THEN cap.p_mort_75_84
+          WHEN '85_plus' THEN cap.p_mort_85_plus
+          ELSE 0.0
+        END * COALESCE(mort.mort_white, 0.0)
+      ) AS ev_mort_white,
+      SUM(
+        CASE mort.mortality_age_band
+          WHEN '18_24'  THEN cap.p_mort_18_24
+          WHEN '25_34'  THEN cap.p_mort_25_34
+          WHEN '35_44'  THEN cap.p_mort_35_44
+          WHEN '45_54'  THEN cap.p_mort_45_54
+          WHEN '55_64'  THEN cap.p_mort_55_64
+          WHEN '65_74'  THEN cap.p_mort_65_74
+          WHEN '75_84'  THEN cap.p_mort_75_84
+          WHEN '85_plus' THEN cap.p_mort_85_plus
+          ELSE 0.0
+        END * COALESCE(mort.mort_black, 0.0)
+      ) AS ev_mort_black,
+      SUM(
+        CASE mort.mortality_age_band
+          WHEN '18_24'  THEN cap.p_mort_18_24
+          WHEN '25_34'  THEN cap.p_mort_25_34
+          WHEN '35_44'  THEN cap.p_mort_35_44
+          WHEN '45_54'  THEN cap.p_mort_45_54
+          WHEN '55_64'  THEN cap.p_mort_55_64
+          WHEN '65_74'  THEN cap.p_mort_65_74
+          WHEN '75_84'  THEN cap.p_mort_75_84
+          WHEN '85_plus' THEN cap.p_mort_85_plus
+          ELSE 0.0
+        END * COALESCE(mort.mort_hisp, 0.0)
+      ) AS ev_mort_hisp,
+      SUM(
+        CASE mort.mortality_age_band
+          WHEN '18_24'  THEN cap.p_mort_18_24
+          WHEN '25_34'  THEN cap.p_mort_25_34
+          WHEN '35_44'  THEN cap.p_mort_35_44
+          WHEN '45_54'  THEN cap.p_mort_45_54
+          WHEN '55_64'  THEN cap.p_mort_55_64
+          WHEN '65_74'  THEN cap.p_mort_65_74
+          WHEN '75_84'  THEN cap.p_mort_75_84
+          WHEN '85_plus' THEN cap.p_mort_85_plus
+          ELSE 0.0
+        END * COALESCE(mort.mort_other, 0.0)
+      ) AS ev_mort_other
+    FROM county_age_probs cap
+    CROSS JOIN cdc_mortality_pivot mort
+    GROUP BY cap.county_geo_id, mort.gender
+  ),
+
+  -- ===========================================================================
+  -- [EV #1] NEW CTE: Expected age-specific stability per county
+  -- Pre-computes the weighted-average age-component stability rate across
+  -- all 13 ACS age bands for a randomly-aged voter in each county.
+  -- Only consumed by the imputed-age path in with_migration.
+  -- ===========================================================================
+  county_expected_stability AS (
+    SELECT
+      cap.county_geo_id,
+      (
+          cap.p_stab_18_19  * COALESCE(s1.five_year_stability_rate, 0.05)
+        + cap.p_stab_20_24  * COALESCE(s2.five_year_stability_rate, 0.05)
+        + cap.p_stab_25_29  * COALESCE(s3.five_year_stability_rate, 0.05)
+        + cap.p_stab_30_34  * COALESCE(s4.five_year_stability_rate, 0.05)
+        + cap.p_stab_35_39  * COALESCE(s5.five_year_stability_rate, 0.05)
+        + cap.p_stab_40_44  * COALESCE(s6.five_year_stability_rate, 0.05)
+        + cap.p_stab_45_49  * COALESCE(s7.five_year_stability_rate, 0.05)
+        + cap.p_stab_50_54  * COALESCE(s8.five_year_stability_rate, 0.05)
+        + cap.p_stab_55_59  * COALESCE(s9.five_year_stability_rate, 0.05)
+        + cap.p_stab_60_64  * COALESCE(s10.five_year_stability_rate, 0.05)
+        + cap.p_stab_65_69  * COALESCE(s11.five_year_stability_rate, 0.05)
+        + cap.p_stab_70_74  * COALESCE(s12.five_year_stability_rate, 0.05)
+        + cap.p_stab_75_plus * COALESCE(s13.five_year_stability_rate, 0.05)
+      ) AS ev_stability_age
+    FROM county_age_probs cap
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s1
+      ON s1.GEO_ID = cap.county_geo_id AND s1.cohort_group = 'age' AND s1.cohort_name = 'age_18_19'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s2
+      ON s2.GEO_ID = cap.county_geo_id AND s2.cohort_group = 'age' AND s2.cohort_name = 'age_20_24'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s3
+      ON s3.GEO_ID = cap.county_geo_id AND s3.cohort_group = 'age' AND s3.cohort_name = 'age_25_29'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s4
+      ON s4.GEO_ID = cap.county_geo_id AND s4.cohort_group = 'age' AND s4.cohort_name = 'age_30_34'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s5
+      ON s5.GEO_ID = cap.county_geo_id AND s5.cohort_group = 'age' AND s5.cohort_name = 'age_35_39'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s6
+      ON s6.GEO_ID = cap.county_geo_id AND s6.cohort_group = 'age' AND s6.cohort_name = 'age_40_44'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s7
+      ON s7.GEO_ID = cap.county_geo_id AND s7.cohort_group = 'age' AND s7.cohort_name = 'age_45_49'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s8
+      ON s8.GEO_ID = cap.county_geo_id AND s8.cohort_group = 'age' AND s8.cohort_name = 'age_50_54'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s9
+      ON s9.GEO_ID = cap.county_geo_id AND s9.cohort_group = 'age' AND s9.cohort_name = 'age_55_59'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s10
+      ON s10.GEO_ID = cap.county_geo_id AND s10.cohort_group = 'age' AND s10.cohort_name = 'age_60_64'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s11
+      ON s11.GEO_ID = cap.county_geo_id AND s11.cohort_group = 'age' AND s11.cohort_name = 'age_65_69'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s12
+      ON s12.GEO_ID = cap.county_geo_id AND s12.cohort_group = 'age' AND s12.cohort_name = 'age_70_74'
+    LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s13
+      ON s13.GEO_ID = cap.county_geo_id AND s13.cohort_group = 'age' AND s13.cohort_name = 'age_75_plus'
+  ),
+
+  -- ===========================================================================
+  -- [EV #1] MODIFIED: 5-year mortality with expected-value branch
+  -- Voter-file-age voters: unchanged single-band CDC lookup.
+  -- Imputed-age voters: expected mortality from county_expected_mortality.
+  -- ===========================================================================
   with_mortality AS (
     SELECT
       g.*,
-      clamp01(1.0 - (
-        (
-          g.p_white * COALESCE(mort.mort_white, 0.0)
-          + g.p_black * COALESCE(mort.mort_black, 0.0)
-          + g.p_hisp  * COALESCE(mort.mort_hisp, 0.0)
-          -- 'other' group receives Asian + NatAm + residual probability mass
-          + (g.p_asian + g.p_natam
-             + GREATEST(0.0, 1.0 - (g.p_white + g.p_black + g.p_hisp + g.p_asian + g.p_natam))
-            ) * COALESCE(mort.mort_other, 0.0)
-        )
-        * mortality_scalar
-      )) AS survival_prob_5yr
+
+      CASE
+        -- Voter-file-age: single-band lookup (unchanged)
+        WHEN g.age_source = 'voter_file' THEN
+          clamp01(1.0 - (
+            (
+              g.p_white * COALESCE(mort.mort_white, 0.0)
+              + g.p_black * COALESCE(mort.mort_black, 0.0)
+              + g.p_hisp  * COALESCE(mort.mort_hisp, 0.0)
+              + (g.p_asian + g.p_natam
+                 + GREATEST(0.0, 1.0 - (g.p_white + g.p_black + g.p_hisp + g.p_asian + g.p_natam))
+                ) * COALESCE(mort.mort_other, 0.0)
+            )
+            * mortality_scalar
+          ))
+
+        -- [EV #1] Imputed-age: expected value across all age bands
+        ELSE
+          clamp01(1.0 - (
+            (
+              g.p_white * COALESCE(cem.ev_mort_white, 0.0)
+              + g.p_black * COALESCE(cem.ev_mort_black, 0.0)
+              + g.p_hisp  * COALESCE(cem.ev_mort_hisp, 0.0)
+              + (g.p_asian + g.p_natam
+                 + GREATEST(0.0, 1.0 - (g.p_white + g.p_black + g.p_hisp + g.p_asian + g.p_natam))
+                ) * COALESCE(cem.ev_mort_other, 0.0)
+            )
+            * mortality_scalar
+          ))
+      END AS survival_prob_5yr
+
     FROM with_global_all g
+
+    -- Single-band join (voter_file path)
     LEFT JOIN cdc_mortality_pivot mort
       ON mort.mortality_age_band = LOWER(age_band(g.effective_age))
       AND mort.gender = COALESCE(g.vb_voterbase_gender, 'Unknown')
+
+    -- [EV #1] Expected-value join (imputed path)
+    LEFT JOIN county_expected_mortality cem
+      ON cem.county_geo_id = g.county_geo_id
+      AND cem.gender = COALESCE(g.vb_voterbase_gender, 'Unknown')
   ),
 
-  -- 5-year migration survival: weighted blend of age, race, and education
-  -- ACS stability rates (60/30/10 weighting). Falls back to overall stability
-  -- if all cohort-specific rates are NULL.
-  -- Also computes race-weighted maturation factor from ACS youth composition shifts.
+  -- ===========================================================================
+  -- [EV #1] MODIFIED: 5-year migration survival with expected-value branch
+  -- Age component: voter-file-age uses single-band lookup; imputed uses
+  -- county_expected_stability. Race and education components are age-independent
+  -- and unchanged for both pathways.
+  -- ===========================================================================
   with_migration AS (
     SELECT
       t.*,
+
       clamp01(
         CASE
           WHEN t.s_age_raw IS NOT NULL
@@ -672,11 +943,11 @@ WITH
       -- assumes no new youth registrants (conservative) rather than neutral
       -- replacement (optimistic). Affects 2 counties across 17 target states.
       (
-        (t.p_white * IFNULL(acs_growth.New_Reg_Factor_White, 1.0)) +
-        (t.p_black * IFNULL(acs_growth.New_Reg_Factor_Black, 1.0)) +
-        (t.p_hisp  * IFNULL(acs_growth.New_Reg_Factor_Hispanic, 1.0)) +
-        (t.p_natam * IFNULL(acs_growth.New_Reg_Factor_NatAm, 1.0)) +
-        (t.p_asian * IFNULL(acs_growth.New_Reg_Factor_Asian, 1.0))
+        (t.p_white * IFNULL(acs_growth.New_Reg_Factor_White, 0.0)) +
+        (t.p_black * IFNULL(acs_growth.New_Reg_Factor_Black, 0.0)) +
+        (t.p_hisp  * IFNULL(acs_growth.New_Reg_Factor_Hispanic, 0.0)) +
+        (t.p_natam * IFNULL(acs_growth.New_Reg_Factor_NatAm, 0.0)) +
+        (t.p_asian * IFNULL(acs_growth.New_Reg_Factor_Asian, 0.0))
         + (1.0 - (t.p_white + t.p_black + t.p_hisp + t.p_natam + t.p_asian)) * 1.0
       ) AS acs_race_weighted_maturation_factor
 
@@ -684,7 +955,15 @@ WITH
       SELECT
         m.*,
         s_overall.five_year_stability_rate AS s_overall,
-        s_age.five_year_stability_rate AS s_age_raw,
+
+        -- [EV #1] Age stability: branch on age_source
+        CASE
+          WHEN m.age_source = 'voter_file'
+          THEN s_age.five_year_stability_rate
+          ELSE ces.ev_stability_age
+        END AS s_age_raw,
+
+        -- Race stability (unchanged)
         SAFE_DIVIDE(
           m.p_white * s_white.five_year_stability_rate +
           m.p_black * s_black.five_year_stability_rate +
@@ -693,14 +972,17 @@ WITH
           m.p_asian * s_asian.five_year_stability_rate,
           NULLIF(m.p_white + m.p_black + m.p_hisp + m.p_natam + m.p_asian, 0.0)
         ) AS s_race_raw,
+
+        -- Education stability (unchanged)
         SAFE_DIVIDE(
           m.high_school_only_prob * s_hs.five_year_stability_rate +
           m.college_prob * s_ba.five_year_stability_rate,
           NULLIF(m.high_school_only_prob + m.college_prob, 0.0)
         ) AS s_edu_raw
+
       FROM with_mortality m
-      LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_overall
-        ON s_overall.GEO_ID = m.county_geo_id AND s_overall.cohort_group = 'overall' AND s_overall.cohort_name = 'overall'
+
+      -- Age-specific stability (voter_file path)
       LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_age
         ON s_age.GEO_ID = m.county_geo_id AND s_age.cohort_group = 'age'
         AND s_age.cohort_name = CASE
@@ -716,13 +998,17 @@ WITH
           WHEN m.effective_age BETWEEN 60 AND 64 THEN 'age_60_64'
           WHEN m.effective_age BETWEEN 65 AND 69 THEN 'age_65_69'
           WHEN m.effective_age BETWEEN 70 AND 74 THEN 'age_70_74'
-          WHEN m.effective_age >= 75 THEN 'age_75_plus'
+          WHEN m.effective_age >= 75              THEN 'age_75_plus'
           ELSE 'age_18_19'
         END
-      LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_hs
-        ON s_hs.GEO_ID = m.county_geo_id AND s_hs.cohort_group = 'education' AND s_hs.cohort_name = 'hs_grad_or_less'
-      LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_ba
-        ON s_ba.GEO_ID = m.county_geo_id AND s_ba.cohort_group = 'education' AND s_ba.cohort_name = 'college_grad'
+
+      -- [EV #1] Expected-value age stability (imputed path)
+      LEFT JOIN county_expected_stability ces
+        ON ces.county_geo_id = m.county_geo_id
+
+      LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_overall
+        ON s_overall.GEO_ID = m.county_geo_id AND s_overall.cohort_group = 'overall' AND s_overall.cohort_name = 'overall'
+
       LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_white
         ON s_white.GEO_ID = m.county_geo_id AND s_white.cohort_group = 'race_ethnicity' AND s_white.cohort_name = 'white'
       LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_black
@@ -733,56 +1019,98 @@ WITH
         ON s_natam.GEO_ID = m.county_geo_id AND s_natam.cohort_group = 'race_ethnicity' AND s_natam.cohort_name = 'natam'
       LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_asian
         ON s_asian.GEO_ID = m.county_geo_id AND s_asian.cohort_group = 'race_ethnicity' AND s_asian.cohort_name = 'asian'
+
+      LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_hs
+        ON s_hs.GEO_ID = m.county_geo_id AND s_hs.cohort_group = 'education' AND s_hs.cohort_name = 'hs_grad_or_less'
+      LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_stability_and_mover_rates` s_ba
+        ON s_ba.GEO_ID = m.county_geo_id AND s_ba.cohort_group = 'education' AND s_ba.cohort_name = 'college_grad'
+
     ) AS t
+
     LEFT JOIN `proj-tmc-mem-fm.main.trends_2025_acs_race_maturation_factors` acs_growth
       ON acs_growth.GEO_ID = t.county_geo_id
   ),
 
-  -- Compute per-voter maturation and mover factors, attach college-town flags
+  -- ===========================================================================
+  -- [EV #1] MODIFIED: Compute per-voter maturation and mover factors
+  -- Voter-file-age: unchanged binary age gates.
+  -- Imputed-age: expected-value maturation and mover factor using county priors.
+  -- ===========================================================================
   weighted_prep AS (
     SELECT
       w.*,
       dcf.is_college_tier1,
       dcf.is_college_tier2,
+
       CASE
         WHEN w.state = 'AZ' THEN migration_in_district_factor_sd
         WHEN w.district_level = 'SD' THEN migration_in_district_factor_sd
         ELSE migration_in_district_factor_hd
       END AS mover_impact_fraction,
 
-      -- Maturation factor for 18-22 year olds: 1 = existing young voters,
-      -- + acs_factor = expected new voters aging in from 15-17 cohort
+      -- MATURATION FACTOR
       CASE
-        WHEN w.effective_age BETWEEN 18 AND 22
-        THEN 1.0 + w.acs_race_weighted_maturation_factor
-        ELSE 1.0
+        WHEN w.age_source = 'voter_file' THEN
+          CASE WHEN w.effective_age BETWEEN 18 AND 22
+               THEN 1.0 + w.acs_race_weighted_maturation_factor
+               ELSE 1.0
+          END
+        -- [EV #1] Imputed: P(18-22) * maturation_factor + P(not 18-22) * 1.0
+        ELSE
+          1.0 + (COALESCE(cap.p_maturation_18_22, 0.0) * w.acs_race_weighted_maturation_factor)
       END AS maturation_factor,
 
+      -- RAW MOVER FACTOR
       CASE
-        WHEN w.effective_age >= min_inmover_age
-        THEN 1.0 + (
-          (1.0 - w.migration_survival_prob_5yr) * CASE
-            WHEN w.state = 'AZ' THEN migration_in_district_factor_sd
-            WHEN w.district_level = 'SD' THEN migration_in_district_factor_sd
-            ELSE migration_in_district_factor_hd
+        WHEN w.age_source = 'voter_file' THEN
+          CASE WHEN w.effective_age >= min_inmover_age
+               THEN 1.0 + (
+                 (1.0 - w.migration_survival_prob_5yr) * CASE
+                   WHEN w.state = 'AZ' THEN migration_in_district_factor_sd
+                   WHEN w.district_level = 'SD' THEN migration_in_district_factor_sd
+                   ELSE migration_in_district_factor_hd
+                 END
+               )
+               ELSE 1.0
           END
-        )
-        ELSE 1.0
-      END AS raw_mover_factor
+        -- [EV #1] Imputed: P(>= min_inmover_age) * mover_factor + P(< min_inmover_age) * 1.0
+        -- Use p_under_25 as proxy for P(< min_inmover_age) (conservative: min_inmover_age=23)
+        ELSE
+          1.0 + (
+            (1.0 - COALESCE(cap.p_under_25, 0.0)) * (
+              (1.0 - w.migration_survival_prob_5yr) * CASE
+                WHEN w.state = 'AZ' THEN migration_in_district_factor_sd
+                WHEN w.district_level = 'SD' THEN migration_in_district_factor_sd
+                ELSE migration_in_district_factor_hd
+              END
+            )
+          )
+      END AS raw_mover_factor,
+
+      -- [EV #1] Carry through for use in weighted CTE floor computation
+      COALESCE(cap.p_under_25, 0.0) AS ev_p_under_25,
+      COALESCE(cap.p_maturation_18_22, 0.0) AS ev_p_maturation_18_22
 
     FROM with_migration w
+    -- [EV #1] Join county age probabilities
+    LEFT JOIN county_age_probs cap ON cap.county_geo_id = w.county_geo_id
     LEFT JOIN district_college_flags dcf
       ON w.state = dcf.state
       AND w.district_level = dcf.district_level
       AND w.district_number = dcf.district_number
   ),
 
-  -- FINAL VOTER WEIGHTS
+  -- ===========================================================================
+  -- [EV #1] MODIFIED: FINAL VOTER WEIGHTS
   -- Split expected_vote_weight into three components so replacement-mover
   -- voters can receive the district mover offset in the aggregation step.
   --   1. staying_weight: survive mortality AND stay in district
   --   2. replacement_youth_weight: 18-22yo aging-in (no mover offset)
   --   3. replacement_mover_weight: in-movers replacing out-movers (gets offset)
+  --
+  -- Voter-file-age: unchanged binary floor/gate logic.
+  -- Imputed-age: expected-value floor and component weights.
+  -- ===========================================================================
   weighted AS (
     SELECT
       vb_voterbase_id,
@@ -811,104 +1139,186 @@ WITH
       raw_mover_factor,
       mover_impact_fraction,
 
-      GREATEST(
-        CASE
-          WHEN effective_age < 25 THEN migration_stability_floor_under_25
-          ELSE migration_stability_floor_25_plus
-        END,
-        1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
-      ) AS migration_survival_prob_5yr_eff,
+      -- EFFECTIVE MIGRATION SURVIVAL (with floor)
+      CASE
+        WHEN w.age_source = 'voter_file' THEN
+          GREATEST(
+            CASE
+              WHEN effective_age < 25 THEN migration_stability_floor_under_25
+              ELSE migration_stability_floor_25_plus
+            END,
+            1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+          )
+        -- [EV #1] Imputed: expected floor
+        ELSE
+          GREATEST(
+            w.ev_p_under_25 * migration_stability_floor_under_25
+              + (1.0 - w.ev_p_under_25) * migration_stability_floor_25_plus,
+            1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+          )
+      END AS migration_survival_prob_5yr_eff,
 
       raw_mover_factor AS mover_factor,
 
       -- Component 1: STAYING WEIGHT
       expected_individual_vote * (
-        survival_prob_5yr * GREATEST(
-          CASE
-            WHEN effective_age < 25 THEN migration_stability_floor_under_25
-            ELSE migration_stability_floor_25_plus
-          END,
-          1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
-        )
+        survival_prob_5yr * CASE
+          WHEN w.age_source = 'voter_file' THEN
+            GREATEST(
+              CASE
+                WHEN effective_age < 25 THEN migration_stability_floor_under_25
+                ELSE migration_stability_floor_25_plus
+              END,
+              1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+            )
+          ELSE
+            GREATEST(
+              w.ev_p_under_25 * migration_stability_floor_under_25
+                + (1.0 - w.ev_p_under_25) * migration_stability_floor_25_plus,
+              1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+            )
+        END
       ) AS staying_weight,
 
       -- Component 2: REPLACEMENT --- YOUTH MATURATION
       -- College-town scalar applied inside the LEAST() cap to prevent double-dampening.
+      -- [EV #1] For imputed voters, maturation_factor already encodes P(18-22),
+      -- so (maturation_factor - 1.0) = P(18-22) * acs_factor. Apply scalar and cap.
       CASE
-        WHEN effective_age BETWEEN 18 AND 22 THEN
+        WHEN w.age_source = 'voter_file' THEN
+          CASE
+            WHEN effective_age BETWEEN 18 AND 22 THEN
+              expected_individual_vote * (
+                LEAST(
+                  (maturation_factor - 1.0) * CASE
+                    WHEN apply_college_town_fix AND is_college_tier2 THEN college_tier2_maturation_scalar
+                    WHEN apply_college_town_fix AND is_college_tier1 THEN college_tier1_maturation_scalar
+                    ELSE 1.0
+                  END,
+                  1.5
+                )
+              )
+            ELSE 0.0
+          END
+        -- [EV #1] Imputed: maturation_factor - 1.0 already = P(18-22) * acs_factor
+        ELSE
           expected_individual_vote * (
             LEAST(
               (maturation_factor - 1.0) * CASE
-                WHEN apply_college_town_fix AND is_college_tier2 THEN
-                  college_tier2_maturation_scalar
-                WHEN apply_college_town_fix AND is_college_tier1 THEN
-                  college_tier1_maturation_scalar
-                ELSE
-                  1.0
+                WHEN apply_college_town_fix AND is_college_tier2 THEN college_tier2_maturation_scalar
+                WHEN apply_college_town_fix AND is_college_tier1 THEN college_tier1_maturation_scalar
+                ELSE 1.0
               END,
               1.5
             )
           )
-        ELSE 0.0
       END AS replacement_youth_weight,
 
       -- Component 3: REPLACEMENT --- IN-MOVERS
       -- Uses floored effective migration survival rate for consistency with staying_weight.
       CASE
-        WHEN effective_age BETWEEN 18 AND 22 THEN 0.0
+        WHEN w.age_source = 'voter_file' THEN
+          CASE
+            WHEN effective_age BETWEEN 18 AND 22 THEN 0.0
+            ELSE
+              expected_individual_vote * (
+                1.0 - GREATEST(
+                  CASE
+                    WHEN effective_age < 25 THEN migration_stability_floor_under_25
+                    ELSE migration_stability_floor_25_plus
+                  END,
+                  1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+                )
+              )
+          END
+        -- [EV #1] Imputed: P(not 18-22) * mover_replacement_rate
         ELSE
-          expected_individual_vote * (
+          expected_individual_vote * (1.0 - w.ev_p_maturation_18_22) * (
             1.0 - GREATEST(
-              CASE
-                WHEN effective_age < 25 THEN migration_stability_floor_under_25
-                ELSE migration_stability_floor_25_plus
-              END,
+              w.ev_p_under_25 * migration_stability_floor_under_25
+                + (1.0 - w.ev_p_under_25) * migration_stability_floor_25_plus,
               1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
             )
           )
       END AS replacement_mover_weight,
 
       -- Total expected_vote_weight = staying + youth replacement + mover replacement
+      -- (Recomputed inline to avoid referencing aliases within the same SELECT)
       (
+        -- staying
         expected_individual_vote * (
-          (
-            survival_prob_5yr * GREATEST(
-              CASE
-                WHEN effective_age < 25 THEN migration_stability_floor_under_25
-                ELSE migration_stability_floor_25_plus
-              END,
-              1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
-            )
-          )
-          +
-          CASE
-            WHEN effective_age BETWEEN 18 AND 22 THEN
-               LEAST(
-                  (maturation_factor - 1.0) * CASE
-                    WHEN apply_college_town_fix AND is_college_tier2 THEN
-                      college_tier2_maturation_scalar
-                    WHEN apply_college_town_fix AND is_college_tier1 THEN
-                      college_tier1_maturation_scalar
-                    ELSE
-                      1.0
-                  END,
-                  1.5
-               )
+          survival_prob_5yr * CASE
+            WHEN w.age_source = 'voter_file' THEN
+              GREATEST(
+                CASE WHEN effective_age < 25 THEN migration_stability_floor_under_25
+                     ELSE migration_stability_floor_25_plus END,
+                1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+              )
             ELSE
-              1.0 - GREATEST(
-                CASE
-                  WHEN effective_age < 25 THEN migration_stability_floor_under_25
-                  ELSE migration_stability_floor_25_plus
-                END,
+              GREATEST(
+                w.ev_p_under_25 * migration_stability_floor_under_25
+                  + (1.0 - w.ev_p_under_25) * migration_stability_floor_25_plus,
                 1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
               )
           END
         )
+        +
+        -- youth maturation
+        CASE
+          WHEN w.age_source = 'voter_file' THEN
+            CASE WHEN effective_age BETWEEN 18 AND 22 THEN
+              expected_individual_vote * (
+                LEAST(
+                  (maturation_factor - 1.0) * CASE
+                    WHEN apply_college_town_fix AND is_college_tier2 THEN college_tier2_maturation_scalar
+                    WHEN apply_college_town_fix AND is_college_tier1 THEN college_tier1_maturation_scalar
+                    ELSE 1.0
+                  END,
+                  1.5
+                )
+              )
+            ELSE 0.0 END
+          ELSE
+            expected_individual_vote * (
+              LEAST(
+                (maturation_factor - 1.0) * CASE
+                  WHEN apply_college_town_fix AND is_college_tier2 THEN college_tier2_maturation_scalar
+                  WHEN apply_college_town_fix AND is_college_tier1 THEN college_tier1_maturation_scalar
+                  ELSE 1.0
+                END,
+                1.5
+              )
+            )
+        END
+        +
+        -- mover replacement
+        CASE
+          WHEN w.age_source = 'voter_file' THEN
+            CASE WHEN effective_age BETWEEN 18 AND 22 THEN 0.0
+            ELSE
+              expected_individual_vote * (
+                1.0 - GREATEST(
+                  CASE WHEN effective_age < 25 THEN migration_stability_floor_under_25
+                       ELSE migration_stability_floor_25_plus END,
+                  1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+                )
+              )
+            END
+          ELSE
+            expected_individual_vote * (1.0 - w.ev_p_maturation_18_22) * (
+              1.0 - GREATEST(
+                w.ev_p_under_25 * migration_stability_floor_under_25
+                  + (1.0 - w.ev_p_under_25) * migration_stability_floor_25_plus,
+                1.0 - mover_impact_fraction * (1.0 - migration_survival_prob_5yr)
+              )
+            )
+        END
       ) AS expected_vote_weight,
 
       dmo.mover_partisan_offset
 
     FROM weighted_prep w
+
     LEFT JOIN district_mover_offset dmo
       ON w.state = dmo.state
       AND w.district_level = dmo.district_level
@@ -1117,7 +1527,7 @@ BEGIN
 
     SELECT format('Successfully created table: %s', output_table_name) as status;
 
-    -- Weighted demographics export (required by Step 5 for driver rankings
+    -- Weighted demographics export (required by Step 3 for driver rankings
     -- using turnout-weighted denominators instead of raw headcounts)
     IF export_weighted_demographics THEN
       EXECUTE IMMEDIATE format("""
@@ -1151,6 +1561,7 @@ BEGIN
       """, demo_table_name);
 
       SELECT format('Successfully created weighted demographics table: %s', demo_table_name) as status;
+
     END IF;
 
   ELSE
@@ -1159,4 +1570,4 @@ BEGIN
 
 END;
 
--- END STEP 2
+-- END STEP 1
