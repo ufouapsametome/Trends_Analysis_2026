@@ -1,14 +1,14 @@
 /*
 ================================================================================
 district_trends_2026_step4_final_report
-v1.0
+v10.1
 adapted from
 trends_2025_district_step6_final_report
 v8.2
 adapted from trends_2025_step6_final_report
 ================================================================================
 Purpose:
-Reads the Step 5 analytics table and produces a human-readable final
+Reads the Step 3 analytics table and produces a human-readable final
 report with natural-language tipping-point explanations for every
 district.
 Generates two fields:
@@ -20,8 +20,8 @@ short for aligned districts, detailed for
 grey-area disconnects.
 v8.1 CHANGES (from v8.0):
 [REV #56] ROUND removed from all band calculations:
-Step 4 §17.3 defines band as total_chamber_seats × fraction (no ROUND).
-Step 6 previously wrapped all band calculations in ROUND(), creating a
+Step 2 §17.3 defines band as total_chamber_seats × fraction (no ROUND).
+Step 4 previously wrapped all band calculations in ROUND(), creating a
 mismatch: for GA House, ROUND(180 × 0.07) = 13 vs raw 12.6. This masked
 rank-cliff districts (GA-HD-070: rank 13, band 12.6, PTP = 1.18%) by
 making them appear inside the band to exception flag logic.
@@ -30,7 +30,7 @@ flag_e5, flag_e6, flag_e7, flag_e8, flag_e9, and exception_priority CASE
 (~17 instances total). Band values are now FLOAT64.
 Impact: districts at the exact ROUND boundary may shift exception flags.
 Expected to affect fewer than 10 districts across 2,620; all shifts are
-corrections aligning Step 6 with Step 4's actual behavior.
+corrections aligning Step 4 with Step 2's actual behavior.
 [REV #57] E6 text enriched with binding-dimension specificity:
 E6 structural context sentence now surfaces which dimension (rank vs
 margin) is the binding constraint:
@@ -155,19 +155,19 @@ string literal modifications in the with_explanation CTE.
 v6.0 CHANGES (from v5.2):
 [REV #29] Tipping condition driver sentences:
 New tipping_condition_display CTE formats pre-computed tipping condition
-drivers from Step 5 (v14.0, Section 8d) into natural-language entry/exit
+drivers from Step 3 (v14.0, Section 8d) into natural-language entry/exit
 cohort descriptions.
-Step 5 performs the analytical work: classifies each vote_choice_scenario
+Step 3 performs the analytical work: classifies each vote_choice_scenario
 as "tipping" or "non-tipping" per district using the targeting-box
 definition, computes per-cohort differentials (tipping avg - non-tipping
-avg), and ranks by absolute magnitude. Step 6 only formats and renders.
+avg), and ranks by absolute magnitude. Step 4 only formats and renders.
 All scenario-dependent districts (0 < PTP < 1) with available drivers now
 open with a sentence specifying the cohort dynamics that bring the
 district into or out of the tipping-point zone.
 Phrasing adapts to PTP tier: [v7.0 REV #44] exit-only for PTP > 0.80,
 two-sided for PTP 0.30-0.80, entry-only for PTP < 0.30.
 Edge-case fallback: districts where all 49 scenarios are unanimously
-tipping or non-tipping (48/0 or 0/48 split) have NULL drivers; Step 6
+tipping or non-tipping (48/0 or 0/48 split) have NULL drivers; Step 4
 omits the scenario sentence and relies on position/exception/convergence
 blocks. Marginal districts with 0/48 splits get a specific fallback
 noting swing-driven entry.
@@ -227,10 +227,10 @@ All exception flag band calculations (E3, E5, E6, E7, E8, E9),
 rank_band, targeting_band, rule_b_rank_met, and exception_priority
 CASE use a.total_chamber_seats as the multiplicand:
 band = total_chamber_seats * fraction
--- [v8.1 REV #56] ROUND removed; Step 4 §17.3 does not ROUND.
+-- [v8.1 REV #56] ROUND removed; Step 2 §17.3 does not ROUND.
 The fraction bracket selector uses ep.effective_ranking_positions
 (district count) to choose 10% (<=50 districts) vs 7% (>50).
-This matches Step 4 §17.3 (unrounded band), where
+This matches Step 2 §17.3 (unrounded band), where
 rank_distance is seat-block-aware (measured in seats) and the band
 must also be in seats for a valid comparison. The fraction is
 conceptually "10% of districts" but expressed in seat-equivalents
@@ -336,14 +336,14 @@ GROUP BY state, chamber
 ),
 --======================================================================
 -- 2. DRIVER DISPLAY-NAME MAPPING
--- Maps raw driver labels from Step 5 to human-readable display names.
+-- Maps raw driver labels from Step 3 to human-readable display names.
 -- [REV #33] Consolidated age buckets: Age_18_To_34, Age_65_Plus.
 -- [v4.1 REV #19] Catholic and Evangelical removed from trend driver
--- slots (separated into dedicated religion_driver system in Step 5
+-- slots (separated into dedicated religion_driver system in Step 3
 -- v13.1). Religion display for trend drivers handled inline in
 -- explanation assembly when religion_driver != 'None'.
 -- [v6.0 REV #29] Catholic and Evangelical RE-INCLUDED here because
--- they CAN appear in tipping condition driver slots (Step 5 v14.0,
+-- they CAN appear in tipping condition driver slots (Step 3 v14.0,
 -- Section 8d UNPIVOT includes them). These entries are consumed
 -- only by the tipping_condition_display CTE, not by trend driver
 -- rendering.
@@ -391,11 +391,11 @@ STRUCT('Evangelical', 'Evangelical voters')
 --======================================================================
 -- 2b. TIPPING CONDITION DISPLAY (NEW in v6.0, REV #29)
 --
--- Formats pre-computed tipping condition driver fields from Step 5
+-- Formats pre-computed tipping condition driver fields from Step 3
 -- (v14.0, Section 8d) into natural-language entry and exit cohort
 -- descriptions for use in explanation text.
 --
--- Step 5 performs the analytical work: for each district, it
+-- Step 3 performs the analytical work: for each district, it
 -- classifies every vote_choice_scenario as "tipping" or "non-tipping"
 -- using the targeting-box definition, computes per-cohort
 -- differentials (mean tipping delta minus mean non-tipping delta),
@@ -405,7 +405,7 @@ STRUCT('Evangelical', 'Evangelical voters')
 -- This CTE only formats the top 2 drivers into display-ready text.
 -- Driver 3 is NOT rendered.
 --
--- Sign convention (from Step 5):
+-- Sign convention (from Step 3):
 -- 'increases' = Dem support rising among this cohort is associated
 -- with the district entering the tipping-point zone.
 -- 'decreases' = Dem support falling among this cohort is associated
@@ -584,7 +584,7 @@ ON a.tipping_condition_driver_2 = td2.raw_name
 classified AS (
 SELECT
 a.*,
--- [v6.0 REV #30] The following Step 5 fields are carried through
+-- [v6.0 REV #30] The following Step 3 fields are carried through
 -- via a.* for consumption by downstream CTEs (not in final_output):
 -- chamber_median_dem_share_2025
 -- tipping_condition_driver_1/2/3, tipping_condition_sign_1/2/3,
@@ -665,7 +665,7 @@ CASE WHEN a.chamber = 'hd' THEN 'House' ELSE 'Senate' END
 -- MULTI-MEMBER CHAMBER FLAG (NEW in v5.0, REV #26)
 -- AZ House (60 seats / 30 districts) and NH House (400 seats /
 -- ~203 districts) elect multiple members per district. Rank
--- distances in Step 5 are computed per-district (one row per
+-- distances in Step 3 are computed per-district (one row per
 -- district), so the numeric values are correct. This flag
 -- controls only the display label: "districts" vs "seats".
 ----------------------------------------------------------------
@@ -682,13 +682,13 @@ OR (a.state = 'NH' AND a.chamber = 'hd')
 -- explanation text (E3/E6 rewrites no longer reference rank_band).
 ----------------------------------------------------------------
 -- [v6.2 REV #41 revised] Band multiplicand is total_chamber_seats
--- (seat count), aligned with Step 4 §17.3 (unrounded band). The
+-- (seat count), aligned with Step 2 §17.3 (unrounded band). The
 -- fraction bracket selector uses effective_ranking_positions (district
 -- count) to choose 10% vs 7%. This ensures the band is in the same
 -- units (seats) as baseline_rank_distance_to_median_2030.
 -- Single-member chambers: unaffected (seats = districts).
 -- Multi-member: AZ House band = 6 seats, NH House band = 40 seats.
--- [v8.1] ROUND removed. Step 4 §17.3 specifies "Band width =
+-- [v8.1] ROUND removed. Step 2 §17.3 specifies "Band width =
 -- total_chamber_seats × fraction" with no ROUND. ROUND(180*0.07)=13
 -- masked rank-cliff districts like GA-HD-070 (rank 13, raw band 12.6).
 a.total_chamber_seats * CASE
@@ -971,11 +971,11 @@ AND ABS(a.dem_baseline_projected_2030 - 0.50) > 0.05
 -- [v6.2 REV #41 revised] All exception flags below use the aligned
 -- band formula: total_chamber_seats * fraction, where fraction
 -- is selected by effective_ranking_positions (district count).
--- This matches Step 4 §17.3 (unrounded band) and Step 5's
+-- This matches Step 2 §17.3 (unrounded band) and Step 3's
 -- scenario_tipping_flag. rank_distance values are seat-based;
 -- band is now also seat-based.
 -- [v8.1] ROUND removed from all band comparisons below.
--- Step 4 §17.3 does not ROUND; prior ROUND in Step 6 masked
+-- Step 2 §17.3 does not ROUND; prior ROUND in earlier versions masked
 -- rank-cliff districts (e.g., GA-HD-070 at rank 13 vs band 12.6).
 -- E3: SMALL CHAMBER RANK EXCLUSION
 -- Close margin but excluded because a small chamber's narrow
@@ -1064,7 +1064,7 @@ ELSE 0.07 END))
 -- name tokens. Both are now replaced by the tipping_condition_display
 -- CTE (entry_cohort_description, exit_cohort_description,
 -- dominant_entry_direction), which sources from pre-computed
--- tipping condition driver fields in Step 5 v14.0.
+-- tipping condition driver fields in Step 3 v14.0.
 ----------------------------------------------------------------
 -- EXCEPTION PRIORITY (NEW in v3.0)
 -- For the structural exceptions (E3-E9), first match wins.
@@ -1085,7 +1085,7 @@ ELSE 0.07 END))
 ----------------------------------------------------------------
 -- [v6.2 REV #41 revised] Band in exception_priority uses same aligned
 -- formula as flag definitions: total_chamber_seats * fraction.
--- [v8.1] ROUND removed to align with Step 4 §17.3.
+-- [v8.1] ROUND removed to align with Step 2 §17.3.
 CASE
 -- Priority 1: NH Multi-Member
 WHEN a.state = 'NH' AND a.chamber = 'hd'
@@ -1207,10 +1207,10 @@ AND ABS(a.dem_baseline_projected_2030 - 0.50) < 0.05
 -- but fmt_baseline_margin always used 2030, causing math inconsistency.
 ----------------------------------------------------------------
 -- [v6.2 REV #31/41] TARGETING BOX FIELDS (for Subcase 4a logic)
--- Band = total_chamber_seats * fraction, aligned with Step 4 §17.3
+-- Band = total_chamber_seats * fraction, aligned with Step 2 §17.3
 -- (unrounded band). Fraction bracket selected by district count.
 -- rank_distance and band are both in seat units.
--- [v8.1] ROUND removed to align with Step 4 §17.3.
+-- [v8.1] ROUND removed to align with Step 2 §17.3.
 ----------------------------------------------------------------
 a.total_chamber_seats * CASE
 WHEN ep.effective_ranking_positions <= 50 THEN 0.10
@@ -1219,7 +1219,7 @@ END AS targeting_band,
 -- Rule A met (margin <= 1.5 pts)
 (ABS(a.baseline_margin_to_median_2030) <= 0.015) AS rule_a_met,
 -- Rule B rank met (rank <= band, both in seats)
--- [v8.1] ROUND removed to align with Step 4 §17.3.
+-- [v8.1] ROUND removed to align with Step 2 §17.3.
 (ABS(a.baseline_rank_distance_to_median_2030)
 <= a.total_chamber_seats * CASE
 WHEN ep.effective_ranking_positions <= 50 THEN 0.10
@@ -2606,7 +2606,7 @@ USING (state, chamber, district_number)
 -- baseline_rank_pct_of_chamber_2030).
 -- [v4.1] REV #19: +2 columns (religion_driver,
 -- religion_driver_scenario_exposure_value).
--- [v4.0] Carry-over field renames applied per Step 5 v13.1:
+-- [v4.0] Carry-over field renames applied per Step 3 v13.1:
 -- REV #22: 5 renamed fields in carry-over list.
 -- REV #23: avg_seats_from_tipping_point →
 -- avg_abs_rank_distance_to_median_2030.
@@ -2644,12 +2644,12 @@ religion_driver,
 -- Volatility & trend
 district_raw_volatility,
 trend_alignment,
--- Raw demographic shares (from Step 5)
+-- Raw demographic shares (from Step 3)
 pct_white,
 pct_black,
 pct_latino,
 pct_asian,
--- [v6.0 REV #30] Additional raw demographic shares (pass-through from Step 5)
+-- [v6.0 REV #30] Additional raw demographic shares (pass-through from Step 3)
 pct_natam,
 pct_nonwhite,
 pct_college,
@@ -2659,7 +2659,7 @@ pct_evangelical,
 pct_female,
 pct_youth_18_34,
 pct_senior_65plus,
--- Demographic vs-state concentration indices (from Step 5)
+-- Demographic vs-state concentration indices (from Step 3)
 -- [v4.0] Renamed from pct_*_vs_state to idx_*_vs_state (REV #20).
 idx_white_vs_state,
 idx_black_vs_state,
@@ -2671,10 +2671,10 @@ idx_high_school_only_vs_state,
 idx_college_vs_state,
 idx_catholic_vs_state,
 idx_evangelical_vs_state,
--- [v6.0 REV #30] Additional demographic indices (pass-through from Step 5)
+-- [v6.0 REV #30] Additional demographic indices (pass-through from Step 3)
 idx_natam_vs_state,
 idx_female_vs_state,
--- [v6.0 REV #30] Tipping-condition diagnostic fields (pass-through from Step 5)
+-- [v6.0 REV #30] Tipping-condition diagnostic fields (pass-through from Step 3)
 tipping_scenario_count,
 non_tipping_scenario_count,
 -- Generated columns
@@ -2688,4 +2688,4 @@ IN UNNEST(diagnostic_districts))
 )
 SELECT * FROM final_output
 ORDER BY state, chamber, district_number;
--- END STEP 6
+-- END STEP 4
