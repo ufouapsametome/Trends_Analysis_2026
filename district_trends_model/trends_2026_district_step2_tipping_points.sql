@@ -1,6 +1,6 @@
 /*
   district_trends_2026_step2
-  v1.0
+  v10.1
   adapted from
   trends_2025_district_step3_4_tipping_point_analysis
   v1.2
@@ -8,15 +8,15 @@
 
   ONLY NEEDS TO BE RUN ONCE
 
-  Merges Step 3 (weighted model outputs) and Step 4 (tipping point identification)
+  Merges weighted model outputs and tipping point identification
   into a single query. Reads HD and SD core model outputs + baselines via UNION ALL,
   processes both chambers in one pass, and writes to a single combined output table.
 
-  Step 3 logic: joins scenario deltas from Step 2 to election baselines from Step 1b,
+  Weighted output logic: joins scenario deltas from Step 1 to election baselines from preliminary query,
   synthesizes NH floterial baselines from child district weights, computes
   new_weighted_share = dem_weighted_baseline + scenario_delta, ranks within state.
 
-  Step 4 logic: assigns seat counts (NH multi-member, AZ 2-member house), computes
+  Tipping logic: assigns seat counts (NH multi-member, AZ 2-member house), computes
   cumulative seats, identifies median/crossover district per scenario, applies tipping
   point classification (TARGETING_BOX hybrid with soft margin decay), aggregates
   favorable/unfavorable tipping counts per district.
@@ -175,7 +175,7 @@ FROM standard_baselines_raw_sd
   ),
 
   -- Join model outputs to baselines, compute new_weighted_share, rank within state.
-  -- Excludes present_day_baseline rows (those are Step 2's internal reference,
+  -- Excludes present_day_baseline rows (those are Step 1's internal reference,
   -- not a forward-looking scenario).
   calculated_shares AS (
     SELECT
@@ -465,7 +465,7 @@ SELECT
     - SAFE_DIVIDE(tc.unfavorable_tipping_scenario_count, tc.total_unfavorable_combos)
     AS tipping_skew,
 
-  -- Raw tipping counts for Step 6 explanation reliability assessment
+  -- Raw tipping counts for Step 4 explanation reliability assessment
   tc.favorable_tipping_scenario_count,
   tc.unfavorable_tipping_scenario_count,
   tc.total_favorable_combos,
@@ -493,4 +493,4 @@ ORDER BY
   SAFE_CAST(tc.district_number AS INT64),
   tc.district_number;
 
-  -- END STEP 3_4
+  -- END STEP 2
