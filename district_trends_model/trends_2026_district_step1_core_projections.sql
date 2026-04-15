@@ -1,6 +1,6 @@
 /*
   district_trends_2026_step1
-  v60.2
+  v61.0
   adapted from
   trends_2025_district_step2_core_2030_model
   v1.3-EV
@@ -20,6 +20,19 @@
 
   Outputs: core_model_outputs_[hd|sd], weighted_demo_shares_[hd|sd]
 
+  v61.0 CHANGES (from v60.2):
+  [REL #1] Added Mormon and Jewish religion indicators alongside the
+           existing Catholic and Evangelical pipeline. Two new voter-file
+           score columns (ts_tsmart_mormon_raw_score,
+           ts_tsmart_jewish_raw_score) flow through scaling, global cohort
+           adjustments, scenario delta application, and the
+           weighted_demo_shares export. Treatment is symmetric with
+           Catholic/Evangelical at this stage; religion-driver selection
+           logic (top-1 across all four) lives in Step 3.
+           Requires: trends_2026_scenarios table extended with
+           delta_mormon and delta_jewish columns.
+  
+  
   v1.3-EV CHANGES (from v1.1):
   [EV #1] Expected-value null-age handling: For voters with imputed ages
            (age_source = 'imputed'), all weight-bearing calculations (mortality,
@@ -76,7 +89,7 @@ DECLARE target_states ARRAY<STRING> DEFAULT
 ['AK','AZ','FL','GA','IA','KS','ME','MI','MN','NC','NH','NV','OH','PA','TX','VA','WI'];
 --['GA','OH']; <--SET DIAGNOSTIC STATES
 
-DECLARE target_district_level STRING DEFAULT 'HD'; -- 'HD' or 'SD'
+DECLARE target_district_level STRING DEFAULT 'SD'; -- 'HD' or 'SD'
 
 -- Uniform swings as integer percentage points (e.g., -6 = 6 pts against Dems).
 -- Stored as INT64 through pipeline output; divide by 100 only at display time
@@ -130,6 +143,8 @@ DECLARE global_all_delta_high_school_only  FLOAT64 DEFAULT 0.00;
 DECLARE global_all_delta_college           FLOAT64 DEFAULT 0.00;
 DECLARE global_all_delta_catholic          FLOAT64 DEFAULT 0.00;
 DECLARE global_all_delta_evangelical       FLOAT64 DEFAULT 0.00;
+DECLARE global_all_delta_mormon            FLOAT64 DEFAULT 0.00;
+DECLARE global_all_delta_jewish            FLOAT64 DEFAULT 0.00;
 DECLARE global_all_delta_age_18_24         FLOAT64 DEFAULT 0.00;
 DECLARE global_all_delta_age_25_34         FLOAT64 DEFAULT 0.00;
 DECLARE global_all_delta_age_35_44         FLOAT64 DEFAULT 0.00;
@@ -143,10 +158,12 @@ DECLARE global_non_present_delta_hisp              FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_black             FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_asian             FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_white             FLOAT64 DEFAULT 0.00;
-DECLARE global_non_present_delta_high_school_only  FLOAT64 DEFAULT -0.005;
-DECLARE global_non_present_delta_college           FLOAT64 DEFAULT 0.005;
+DECLARE global_non_present_delta_high_school_only  FLOAT64 DEFAULT 0.00; --formerly -0.005
+DECLARE global_non_present_delta_college           FLOAT64 DEFAULT 0.00; --formerly 0.005
 DECLARE global_non_present_delta_catholic          FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_evangelical       FLOAT64 DEFAULT 0.00;
+DECLARE global_non_present_delta_mormon            FLOAT64 DEFAULT 0.00;
+DECLARE global_non_present_delta_jewish            FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_age_18_24         FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_age_25_34         FLOAT64 DEFAULT 0.00;
 DECLARE global_non_present_delta_age_35_44         FLOAT64 DEFAULT 0.00;
@@ -246,6 +263,8 @@ WITH
       v.ts_tsmart_high_school_only_score,
       v.ts_tsmart_catholic_raw_score,
       v.ts_tsmart_evangelical_raw_score,
+      v.ts_tsmart_mormon_raw_score,
+      v.ts_tsmart_jewish_raw_score,
       v.ts_tsmr_p_white,
       v.ts_tsmr_p_black,
       v.ts_tsmr_p_hisp,
@@ -424,6 +443,8 @@ WITH
       clamp01(ts_tsmart_high_school_only_score / 100.0) AS high_school_only_prob,
       clamp01(ts_tsmart_catholic_raw_score / 100.0) AS catholic_prob,
       clamp01(ts_tsmart_evangelical_raw_score / 100.0) AS evangelical_prob,
+      clamp01(ts_tsmart_mormon_raw_score / 100.0) AS mormon_prob,
+      clamp01(ts_tsmart_jewish_raw_score / 100.0) AS jewish_prob,
       clamp01(ts_tsmr_p_white) AS p_white,
       clamp01(ts_tsmr_p_black) AS p_black,
       clamp01(ts_tsmr_p_hisp) AS p_hisp,
@@ -694,6 +715,8 @@ WITH
         + (college_prob * global_all_delta_college)
         + (catholic_prob * global_all_delta_catholic)
         + (evangelical_prob * global_all_delta_evangelical)
+        + (mormon_prob * global_all_delta_mormon)
+        + (jewish_prob * global_all_delta_jewish)
         + (age_18_24_flag * global_all_delta_age_18_24)
         + (age_25_34_flag * global_all_delta_age_25_34)
         + (age_35_44_flag * global_all_delta_age_35_44)
@@ -1129,6 +1152,7 @@ WITH
       p_white, p_black, p_hisp, p_natam, p_asian,
       college_prob, high_school_only_prob,
       catholic_prob, evangelical_prob,
+      mormon_prob, jewish_prob,
       age_18_24_flag, age_25_34_flag, age_35_44_flag, age_45_54_flag,
       age_55_64_flag, age_65_74_flag, age_75_84_flag, age_85_plus_flag,
       female_flag, male_flag,
@@ -1343,6 +1367,7 @@ WITH
       vc.delta_hisp, vc.delta_black, vc.delta_asian, vc.delta_natam, vc.delta_white,
       vc.delta_high_school_only, vc.delta_college,
       vc.delta_catholic, vc.delta_evangelical,
+      vc.delta_mormon, vc.delta_jewish,
       vc.delta_age_18_24, vc.delta_age_25_34, vc.delta_age_35_44, vc.delta_age_45_54,
       vc.delta_age_55_64, vc.delta_age_65_74, vc.delta_age_75_84, vc.delta_age_85_plus,
       vc.delta_female, vc.delta_male,
@@ -1373,6 +1398,8 @@ WITH
         + (p.college_prob * global_non_present_delta_college)
         + (p.catholic_prob * global_non_present_delta_catholic)
         + (p.evangelical_prob * global_non_present_delta_evangelical)
+        + (p.mormon_prob * global_non_present_delta_mormon)
+        + (p.jewish_prob * global_non_present_delta_jewish)
         + (p.age_18_24_flag * global_non_present_delta_age_18_24)
         + (p.age_25_34_flag * global_non_present_delta_age_25_34)
         + (p.age_35_44_flag * global_non_present_delta_age_35_44)
@@ -1391,6 +1418,8 @@ WITH
         + (p.college_prob * sg.delta_college)
         + (p.catholic_prob * sg.delta_catholic)
         + (p.evangelical_prob * sg.delta_evangelical)
+        + (p.mormon_prob * sg.delta_mormon)
+        + (p.jewish_prob * sg.delta_jewish)
         + (p.age_18_24_flag * sg.delta_age_18_24)
         + (p.age_25_34_flag * sg.delta_age_25_34)
         + (p.age_35_44_flag * sg.delta_age_35_44)
@@ -1547,6 +1576,8 @@ BEGIN
           SAFE_DIVIDE(SUM(expected_vote_weight * high_school_only_prob), SUM(expected_vote_weight)) as weighted_pct_high_school_only,
           SAFE_DIVIDE(SUM(expected_vote_weight * catholic_prob), SUM(expected_vote_weight)) as weighted_pct_catholic,
           SAFE_DIVIDE(SUM(expected_vote_weight * evangelical_prob), SUM(expected_vote_weight)) as weighted_pct_evangelical,
+          SAFE_DIVIDE(SUM(expected_vote_weight * mormon_prob), SUM(expected_vote_weight)) as weighted_pct_mormon,
+          SAFE_DIVIDE(SUM(expected_vote_weight * jewish_prob), SUM(expected_vote_weight)) as weighted_pct_jewish,
           SAFE_DIVIDE(SUM(expected_vote_weight * female_flag), SUM(expected_vote_weight)) as weighted_pct_female,
           SAFE_DIVIDE(SUM(expected_vote_weight * age_18_24_flag), SUM(expected_vote_weight)) as weighted_pct_age_18_24,
           SAFE_DIVIDE(SUM(expected_vote_weight * age_25_34_flag), SUM(expected_vote_weight)) as weighted_pct_age_25_34,
