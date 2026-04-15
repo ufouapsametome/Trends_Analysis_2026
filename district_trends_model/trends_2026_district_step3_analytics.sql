@@ -1,10 +1,12 @@
 /*
   district_trends_2026_step3_analytics
-  v2.1
+  v3.0
   adapted from
   trends_2025_district_step5_analytics
   v1.4
   adapted from trends_2025_step5_district_analytics
+
+  ONLY NEEDS TO BE RUN ONCE
 
   Builds the deep analytics profile for every legislative district. Serves as
   the intermediate table powering Step 4 explanation generation.
@@ -13,6 +15,29 @@
   all scenarios), volatility, trend alignment, demographic driver ranking
   (weighted distinctive influence), lever exposure, scenario tipping profile,
   religion driver evaluation, and tipping condition drivers.
+
+  v3.0 CHANGES (from v2.1):
+  [REL #1] Added Mormon and Jewish religion indicators throughout, mirroring
+           Catholic/Evangelical handling: voter_base, voter_district_mapped,
+           district_demographics_raw, state_demo_averages, scenario_lever_ranges,
+           state_weighted_averages, district_lever_exposure,
+           district_distinctive_influence (computed but excluded from trend
+           driver UNPIVOT), tipping_cohort_differential and the tipping driver
+           UNPIVOT, and the final assembled output (pct_*, idx_*_vs_state,
+           scenario_exposure_*).
+
+  [REL #2] Religion driver framework expanded from 2 to 4 candidates
+           (Catholic, Evangelical, Mormon, Jewish). state_mean_religion_exposure
+           extended; religion_driver_eval qualifies all four; religion_driver_ranked
+           picks the single highest qualified exposure across all four (top-1).
+
+  [REL #3] Religion driver qualification gains an absolute share floor of 10%.
+           A religion now qualifies as a driver only if weighted_pct_<religion>
+           >= 0.10 AND the existing 1.10x state-share AND 1.10x state-mean-
+           exposure thresholds are met. Prevents sparse cohorts (Mormon ~2%,
+           Jewish ~2% nationally) from over-surfacing on a relative-only test.
+           Catholic/Evangelical behavior is unaffected at typical district
+           shares (15-30%).
 
   v1.4 changes:
     - NEW: Urbanicity classification from TargetSmart ts_tsmart_urbanicity.
@@ -45,11 +70,11 @@
 */
 
 -- CONFIGURATION
-DECLARE execution_mode STRING DEFAULT 'SELECT'; --<-- 'SELECT' for diagnostics, 'TABLE' for prod
+DECLARE execution_mode STRING DEFAULT 'TABLE'; --<-- 'SELECT' for diagnostics, 'TABLE' for prod
 DECLARE output_table STRING DEFAULT 'proj-tmc-mem-fm.main.trends_2025_district_analytics';
 DECLARE baseline_vote_choice_scenario STRING DEFAULT 'balanced_Baseline';
 
-DECLARE diagnostic_mode BOOL DEFAULT TRUE; --<--TRUE for diagnostics
+DECLARE diagnostic_mode BOOL DEFAULT FALSE; --<--TRUE for diagnostics
 DECLARE target_states ARRAY<STRING> DEFAULT [
 'AK','AZ','FL','GA','IA','KS','ME','MI','MN','NC','NH','NV','OH','PA','TX','VA','WI'
 ];
@@ -482,6 +507,7 @@ voter_base AS (
     v.ts_tsmr_p_asian, v.ts_tsmr_p_natam,
     v.ts_tsmart_college_graduate_score, v.ts_tsmart_high_school_only_score,
     v.ts_tsmart_catholic_raw_score, v.ts_tsmart_evangelical_raw_score,
+    v.ts_tsmart_mormon_raw_score, v.ts_tsmart_jewish_raw_score,
     v.vb_tsmart_county_code,
     -- [v1.4] Urbanicity for district classification
     v.ts_tsmart_urbanicity
@@ -529,6 +555,7 @@ voter_district_mapped AS (
     ts_tsmr_p_asian, adjusted_p_natam AS ts_tsmr_p_natam,
     ts_tsmart_college_graduate_score, ts_tsmart_high_school_only_score,
     ts_tsmart_catholic_raw_score, ts_tsmart_evangelical_raw_score,
+    ts_tsmart_mormon_raw_score, ts_tsmart_jewish_raw_score,
     ts_tsmart_urbanicity
   FROM voter_base_corrected WHERE vb_vf_hd IS NOT NULL
   UNION ALL
@@ -538,6 +565,7 @@ voter_district_mapped AS (
     vb.ts_tsmr_p_asian, vb.adjusted_p_natam AS ts_tsmr_p_natam,
     vb.ts_tsmart_college_graduate_score, vb.ts_tsmart_high_school_only_score,
     vb.ts_tsmart_catholic_raw_score, vb.ts_tsmart_evangelical_raw_score,
+    vb.ts_tsmart_mormon_raw_score, vb.ts_tsmart_jewish_raw_score,
     vb.ts_tsmart_urbanicity
   FROM voter_base_corrected vb
   JOIN `proj-tmc-mem-fm.main.trends_2025_NH_District_Name_Counts_and_Designation_xref` nx
@@ -552,6 +580,7 @@ voter_district_mapped AS (
     ts_tsmr_p_asian, adjusted_p_natam AS ts_tsmr_p_natam,
     ts_tsmart_college_graduate_score, ts_tsmart_high_school_only_score,
     ts_tsmart_catholic_raw_score, ts_tsmart_evangelical_raw_score,
+    ts_tsmart_mormon_raw_score, ts_tsmart_jewish_raw_score,
     ts_tsmart_urbanicity
   FROM voter_base_corrected WHERE vb_vf_sd IS NOT NULL
 ),
@@ -570,6 +599,8 @@ district_demographics_raw AS (
     AVG(LEAST(GREATEST(ts_tsmart_high_school_only_score / 100.0, 0), 1)) AS pct_high_school_only,
     AVG(LEAST(GREATEST(ts_tsmart_catholic_raw_score / 100.0, 0), 1)) AS pct_catholic,
     AVG(LEAST(GREATEST(ts_tsmart_evangelical_raw_score / 100.0, 0), 1)) AS pct_evangelical,
+    AVG(LEAST(GREATEST(ts_tsmart_mormon_raw_score / 100.0, 0), 1)) AS pct_mormon,
+    AVG(LEAST(GREATEST(ts_tsmart_jewish_raw_score / 100.0, 0), 1)) AS pct_jewish,
     SAFE_DIVIDE(COUNTIF(vb_voterbase_gender = 'Female'), COUNT(*)) AS pct_female,
     SAFE_DIVIDE(COUNTIF(effective_age BETWEEN 18 AND 34), COUNT(*)) AS pct_youth_18_34,
     SAFE_DIVIDE(COUNTIF(effective_age >= 65), COUNT(*)) AS pct_senior_65plus
@@ -697,6 +728,8 @@ state_demo_averages AS (
     AVG(LEAST(GREATEST(ts_tsmart_high_school_only_score / 100.0, 0), 1)) AS state_avg_pct_high_school_only,
     AVG(LEAST(GREATEST(ts_tsmart_catholic_raw_score / 100.0, 0), 1)) AS state_avg_pct_catholic,
     AVG(LEAST(GREATEST(ts_tsmart_evangelical_raw_score / 100.0, 0), 1)) AS state_avg_pct_evangelical,
+    AVG(LEAST(GREATEST(ts_tsmart_mormon_raw_score / 100.0, 0), 1)) AS state_avg_pct_mormon,
+    AVG(LEAST(GREATEST(ts_tsmart_jewish_raw_score / 100.0, 0), 1)) AS state_avg_pct_jewish,
     SAFE_DIVIDE(COUNTIF(vb_voterbase_gender = 'Female'), COUNT(*)) AS state_avg_pct_female,
     SAFE_DIVIDE(COUNTIF(effective_age BETWEEN 18 AND 34), COUNT(*)) AS state_avg_pct_youth_18_34,
     SAFE_DIVIDE(COUNTIF(effective_age >= 65), COUNT(*)) AS state_avg_pct_senior_65plus
@@ -714,6 +747,8 @@ state_demo_averages AS (
     AVG(LEAST(GREATEST(ts_tsmart_high_school_only_score / 100.0, 0), 1)) AS state_avg_pct_high_school_only,
     AVG(LEAST(GREATEST(ts_tsmart_catholic_raw_score / 100.0, 0), 1)) AS state_avg_pct_catholic,
     AVG(LEAST(GREATEST(ts_tsmart_evangelical_raw_score / 100.0, 0), 1)) AS state_avg_pct_evangelical,
+    AVG(LEAST(GREATEST(ts_tsmart_mormon_raw_score / 100.0, 0), 1)) AS state_avg_pct_mormon,
+    AVG(LEAST(GREATEST(ts_tsmart_jewish_raw_score / 100.0, 0), 1)) AS state_avg_pct_jewish,
     SAFE_DIVIDE(COUNTIF(vb_voterbase_gender = 'Female'), COUNT(*)) AS state_avg_pct_female,
     SAFE_DIVIDE(COUNTIF(effective_age BETWEEN 18 AND 34), COUNT(*)) AS state_avg_pct_youth_18_34,
     SAFE_DIVIDE(COUNTIF(effective_age >= 65), COUNT(*)) AS state_avg_pct_senior_65plus
@@ -735,6 +770,8 @@ scenario_lever_ranges AS (
     ABS(MAX(delta_high_school_only) - MIN(delta_high_school_only)) AS range_high_school_only,
     ABS(MAX(delta_catholic) - MIN(delta_catholic)) AS range_catholic,
     ABS(MAX(delta_evangelical) - MIN(delta_evangelical)) AS range_evangelical,
+    ABS(MAX(delta_mormon) - MIN(delta_mormon)) AS range_mormon,
+    ABS(MAX(delta_jewish) - MIN(delta_jewish)) AS range_jewish,
     ABS(MAX(delta_female) - MIN(delta_female)) AS range_female,
     ABS(MAX(delta_male) - MIN(delta_male)) AS range_male,
     ABS(MAX(delta_age_18_24 + delta_age_25_34) - MIN(delta_age_18_24 + delta_age_25_34))
@@ -758,6 +795,8 @@ state_weighted_averages AS (
     SAFE_DIVIDE(SUM(weighted_pct_high_school_only * total_weight), SUM(total_weight)) AS w_avg_high_school_only,
     SAFE_DIVIDE(SUM(weighted_pct_catholic * total_weight), SUM(total_weight)) AS w_avg_catholic,
     SAFE_DIVIDE(SUM(weighted_pct_evangelical * total_weight), SUM(total_weight)) AS w_avg_evangelical,
+    SAFE_DIVIDE(SUM(weighted_pct_mormon * total_weight), SUM(total_weight)) AS w_avg_mormon,
+    SAFE_DIVIDE(SUM(weighted_pct_jewish * total_weight), SUM(total_weight)) AS w_avg_jewish,
     SAFE_DIVIDE(SUM(weighted_pct_female * total_weight), SUM(total_weight)) AS w_avg_female,
     SAFE_DIVIDE(SUM((weighted_pct_age_18_24 + weighted_pct_age_25_34) * total_weight),
       SUM(total_weight)) AS w_avg_age_18_to_34,
@@ -780,6 +819,8 @@ district_lever_exposure AS (
     d.weighted_pct_high_school_only * slr.range_high_school_only AS exposure_high_school_only,
     d.weighted_pct_catholic * slr.range_catholic AS exposure_catholic,
     d.weighted_pct_evangelical * slr.range_evangelical AS exposure_evangelical,
+    d.weighted_pct_mormon * slr.range_mormon AS exposure_mormon,
+    d.weighted_pct_jewish * slr.range_jewish AS exposure_jewish,
     d.weighted_pct_female * slr.range_female AS exposure_female,
     (1.0 - d.weighted_pct_female) * slr.range_male AS exposure_male,
     (d.weighted_pct_age_18_24 + d.weighted_pct_age_25_34) * slr.range_age_18_to_34
@@ -796,7 +837,7 @@ district_lever_exposure AS (
 
 -- DI = GREATEST(district_share - state_avg, 0) × lever_range × signal_gate
 -- Signal gate = LEAST(district_share / 0.10, 1.0) suppresses tiny cohorts.
--- Catholic/Evangelical computed but excluded from UNPIVOT (separate religion driver).
+-- Catholic/Evangelical/Mormon/Jewish computed but excluded from UNPIVOT (separate religion driver).
 district_distinctive_influence AS (
   SELECT
     d.state, d.chamber, d.district_number,
@@ -809,6 +850,8 @@ district_distinctive_influence AS (
     GREATEST(d.weighted_pct_high_school_only - sa.w_avg_high_school_only, 0) * slr.range_high_school_only * LEAST(1.0, d.weighted_pct_high_school_only / 0.10) AS di_high_school_only,
     GREATEST(d.weighted_pct_catholic - sa.w_avg_catholic, 0) * slr.range_catholic * LEAST(1.0, d.weighted_pct_catholic / 0.10) AS di_catholic,
     GREATEST(d.weighted_pct_evangelical - sa.w_avg_evangelical, 0) * slr.range_evangelical * LEAST(1.0, d.weighted_pct_evangelical / 0.10) AS di_evangelical,
+    GREATEST(d.weighted_pct_mormon - sa.w_avg_mormon, 0) * slr.range_mormon * LEAST(1.0, d.weighted_pct_mormon / 0.10) AS di_mormon,
+    GREATEST(d.weighted_pct_jewish - sa.w_avg_jewish, 0) * slr.range_jewish * LEAST(1.0, d.weighted_pct_jewish / 0.10) AS di_jewish,
     GREATEST(d.weighted_pct_female - sa.w_avg_female, 0) * slr.range_female * LEAST(1.0, d.weighted_pct_female / 0.10) AS di_female,
     GREATEST((1.0 - d.weighted_pct_female) - (1.0 - sa.w_avg_female), 0) * slr.range_male * LEAST(1.0, (1.0 - d.weighted_pct_female) / 0.10) AS di_male,
     GREATEST((d.weighted_pct_age_18_24 + d.weighted_pct_age_25_34) - sa.w_avg_age_18_to_34, 0)
@@ -906,48 +949,104 @@ state_mean_religion_exposure AS (
   SELECT
     state, chamber,
     AVG(exposure_catholic) AS state_mean_exposure_catholic,
-    AVG(exposure_evangelical) AS state_mean_exposure_evangelical
+    AVG(exposure_evangelical) AS state_mean_exposure_evangelical,
+    AVG(exposure_mormon) AS state_mean_exposure_mormon,
+    AVG(exposure_jewish) AS state_mean_exposure_jewish
   FROM district_lever_exposure
   GROUP BY state, chamber
 ),
 
+-- [REL #2/REL #3] Religion driver eval extended from 2 to 4 candidates
+-- (Catholic, Evangelical, Mormon, Jewish). All four use identical
+-- qualification rules:
+--   (a) weighted_pct_<religion> >= 0.10  [REL #3 absolute share floor]
+--   (b) weighted_pct_<religion> / state_avg >= 1.10
+--   (c) exposure_<religion> / state_mean_exposure >= 1.10
+-- The 10% absolute floor prevents sparse cohorts (Mormon ~2%, Jewish ~2%
+-- nationally) from qualifying via relative-only tests in districts where
+-- the cohort is still numerically small. Catholic/Evangelical qualification
+-- is unaffected at typical district shares (15-30%).
 religion_driver_eval AS (
   SELECT
     d.state, d.chamber, d.district_number,
     CASE
-      WHEN SAFE_DIVIDE(d.weighted_pct_catholic, sa.w_avg_catholic) >= 1.10
+      WHEN d.weighted_pct_catholic >= 0.10
+        AND SAFE_DIVIDE(d.weighted_pct_catholic, sa.w_avg_catholic) >= 1.10
         AND SAFE_DIVIDE(dle.exposure_catholic, sme.state_mean_exposure_catholic) >= 1.10
       THEN dle.exposure_catholic
       ELSE NULL
     END AS catholic_qualified_exposure,
     CASE
-      WHEN SAFE_DIVIDE(d.weighted_pct_evangelical, sa.w_avg_evangelical) >= 1.10
+      WHEN d.weighted_pct_evangelical >= 0.10
+        AND SAFE_DIVIDE(d.weighted_pct_evangelical, sa.w_avg_evangelical) >= 1.10
         AND SAFE_DIVIDE(dle.exposure_evangelical, sme.state_mean_exposure_evangelical) >= 1.10
       THEN dle.exposure_evangelical
       ELSE NULL
-    END AS evangelical_qualified_exposure
+    END AS evangelical_qualified_exposure,
+    CASE
+      WHEN d.weighted_pct_mormon >= 0.10
+        AND SAFE_DIVIDE(d.weighted_pct_mormon, sa.w_avg_mormon) >= 1.10
+        AND SAFE_DIVIDE(dle.exposure_mormon, sme.state_mean_exposure_mormon) >= 1.10
+      THEN dle.exposure_mormon
+      ELSE NULL
+    END AS mormon_qualified_exposure,
+    CASE
+      WHEN d.weighted_pct_jewish >= 0.10
+        AND SAFE_DIVIDE(d.weighted_pct_jewish, sa.w_avg_jewish) >= 1.10
+        AND SAFE_DIVIDE(dle.exposure_jewish, sme.state_mean_exposure_jewish) >= 1.10
+      THEN dle.exposure_jewish
+      ELSE NULL
+    END AS jewish_qualified_exposure
   FROM weighted_demo_union d
   JOIN state_weighted_averages sa USING (state, chamber)
   JOIN district_lever_exposure dle USING (state, chamber, district_number)
   JOIN state_mean_religion_exposure sme USING (state, chamber)
 ),
 
+-- [REL #2] Top-1 picker extended from 2 to 4 religion candidates.
+-- Uses a STRUCT array + ORDER BY to argmax cleanly across all four; the
+-- nested CASE pattern from the 2-religion version doesn't scale gracefully.
+-- Ties are broken in declaration order (Catholic > Evangelical > Mormon >
+-- Jewish), which matches the previous Catholic-first tiebreak behavior.
 religion_driver_ranked AS (
   SELECT
     state, chamber, district_number,
+    -- Pick the single religion with the highest qualified exposure,
+    -- or 'None' if no religion qualifies.
+    COALESCE(
+      (SELECT name
+       FROM UNNEST([
+         STRUCT('Catholic'    AS name, catholic_qualified_exposure    AS exposure),
+         STRUCT('Evangelical' AS name, evangelical_qualified_exposure AS exposure),
+         STRUCT('Mormon'      AS name, mormon_qualified_exposure      AS exposure),
+         STRUCT('Jewish'      AS name, jewish_qualified_exposure      AS exposure)
+       ])
+       WHERE exposure IS NOT NULL
+       ORDER BY exposure DESC
+       LIMIT 1),
+      'None'
+    ) AS religion_driver,
+    -- Exposure value of the winning religion, or NULL if none qualified.
+    GREATEST(
+      COALESCE(catholic_qualified_exposure, 0),
+      COALESCE(evangelical_qualified_exposure, 0),
+      COALESCE(mormon_qualified_exposure, 0),
+      COALESCE(jewish_qualified_exposure, 0)
+    ) AS religion_driver_scenario_exposure_value_raw,
+    -- Wrap in CASE to preserve NULL semantics: if no religion qualified,
+    -- the exposure value should be NULL, not 0.
     CASE
-      WHEN catholic_qualified_exposure IS NOT NULL AND evangelical_qualified_exposure IS NOT NULL
-        THEN CASE WHEN catholic_qualified_exposure >= evangelical_qualified_exposure THEN 'Catholic' ELSE 'Evangelical' END
-      WHEN catholic_qualified_exposure IS NOT NULL THEN 'Catholic'
-      WHEN evangelical_qualified_exposure IS NOT NULL THEN 'Evangelical'
-      ELSE 'None'
-    END AS religion_driver,
-    CASE
-      WHEN catholic_qualified_exposure IS NOT NULL AND evangelical_qualified_exposure IS NOT NULL
-        THEN GREATEST(catholic_qualified_exposure, evangelical_qualified_exposure)
-      WHEN catholic_qualified_exposure IS NOT NULL THEN catholic_qualified_exposure
-      WHEN evangelical_qualified_exposure IS NOT NULL THEN evangelical_qualified_exposure
-      ELSE NULL
+      WHEN catholic_qualified_exposure IS NULL
+       AND evangelical_qualified_exposure IS NULL
+       AND mormon_qualified_exposure IS NULL
+       AND jewish_qualified_exposure IS NULL
+      THEN NULL
+      ELSE GREATEST(
+        COALESCE(catholic_qualified_exposure, 0),
+        COALESCE(evangelical_qualified_exposure, 0),
+        COALESCE(mormon_qualified_exposure, 0),
+        COALESCE(jewish_qualified_exposure, 0)
+      )
     END AS religion_driver_scenario_exposure_value
   FROM religion_driver_eval
 ),
@@ -1013,6 +1112,10 @@ tipping_cohort_differential AS (
       - AVG(IF(stf.is_tipping_scenario = 0, s.delta_catholic, NULL)) AS diff_catholic,
     AVG(IF(stf.is_tipping_scenario = 1, s.delta_evangelical, NULL))
       - AVG(IF(stf.is_tipping_scenario = 0, s.delta_evangelical, NULL)) AS diff_evangelical,
+    AVG(IF(stf.is_tipping_scenario = 1, s.delta_mormon, NULL))
+      - AVG(IF(stf.is_tipping_scenario = 0, s.delta_mormon, NULL)) AS diff_mormon,
+    AVG(IF(stf.is_tipping_scenario = 1, s.delta_jewish, NULL))
+      - AVG(IF(stf.is_tipping_scenario = 0, s.delta_jewish, NULL)) AS diff_jewish,
     AVG(IF(stf.is_tipping_scenario = 1, s.delta_female, NULL))
       - AVG(IF(stf.is_tipping_scenario = 0, s.delta_female, NULL)) AS diff_female,
     AVG(IF(stf.is_tipping_scenario = 1, s.delta_male, NULL))
@@ -1054,6 +1157,8 @@ tipping_driver_ranking AS (
         WHEN 'diff_high_school_only' THEN wdu.weighted_pct_high_school_only
         WHEN 'diff_catholic' THEN wdu.weighted_pct_catholic
         WHEN 'diff_evangelical' THEN wdu.weighted_pct_evangelical
+        WHEN 'diff_mormon' THEN wdu.weighted_pct_mormon
+        WHEN 'diff_jewish' THEN wdu.weighted_pct_jewish
         WHEN 'diff_female' THEN wdu.weighted_pct_female
         WHEN 'diff_male' THEN 1.0 - wdu.weighted_pct_female
         WHEN 'diff_age_18_to_34' THEN wdu.weighted_pct_age_18_24 + wdu.weighted_pct_age_25_34
@@ -1066,6 +1171,7 @@ tipping_driver_ranking AS (
         diff_latino, diff_black, diff_asian, diff_natam, diff_white,
         diff_college, diff_high_school_only,
         diff_catholic, diff_evangelical,
+        diff_mormon, diff_jewish,
         diff_female, diff_male,
         diff_age_18_to_34, diff_age_65_plus
       )
@@ -1211,6 +1317,7 @@ assembled AS (
     dd.pct_natam, dd.pct_nonwhite,
     dd.pct_college, dd.pct_high_school_only,
     dd.pct_catholic, dd.pct_evangelical,
+    dd.pct_mormon, dd.pct_jewish,
     dd.pct_female,
     dd.pct_youth_18_34, dd.pct_senior_65plus,
 
@@ -1235,6 +1342,10 @@ assembled AS (
       * LEAST(dd.pct_catholic / 0.02, 1.0) AS idx_catholic_vs_state,
     1.0 + (SAFE_DIVIDE(dd.pct_evangelical, GREATEST(sa.state_avg_pct_evangelical, 0.01)) - 1.0)
       * LEAST(dd.pct_evangelical / 0.02, 1.0) AS idx_evangelical_vs_state,
+    1.0 + (SAFE_DIVIDE(dd.pct_mormon, GREATEST(sa.state_avg_pct_mormon, 0.01)) - 1.0)
+      * LEAST(dd.pct_mormon / 0.02, 1.0) AS idx_mormon_vs_state,
+    1.0 + (SAFE_DIVIDE(dd.pct_jewish, GREATEST(sa.state_avg_pct_jewish, 0.01)) - 1.0)
+      * LEAST(dd.pct_jewish / 0.02, 1.0) AS idx_jewish_vs_state,
     1.0 + (SAFE_DIVIDE(dd.pct_female, GREATEST(sa.state_avg_pct_female, 0.01)) - 1.0)
       * LEAST(dd.pct_female / 0.02, 1.0) AS idx_female_vs_state,
     1.0 + (SAFE_DIVIDE(dd.pct_youth_18_34, GREATEST(sa.state_avg_pct_youth_18_34, 0.01)) - 1.0)
@@ -1252,6 +1363,8 @@ assembled AS (
     dle.exposure_high_school_only AS scenario_exposure_high_school_only,
     dle.exposure_catholic AS scenario_exposure_catholic,
     dle.exposure_evangelical AS scenario_exposure_evangelical,
+    dle.exposure_mormon AS scenario_exposure_mormon,
+    dle.exposure_jewish AS scenario_exposure_jewish,
     dle.exposure_female AS scenario_exposure_female,
     dle.exposure_male AS scenario_exposure_male,
     dle.exposure_age_18_to_34 AS scenario_exposure_age_18_to_34,
