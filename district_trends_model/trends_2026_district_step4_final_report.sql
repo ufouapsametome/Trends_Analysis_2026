@@ -1,12 +1,36 @@
 /*
 ================================================================================
 district_trends_2026_step4_final_report
-v10.1
+v11.0
 adapted from
 trends_2025_district_step6_final_report
 v8.2
 adapted from trends_2025_step6_final_report
 ================================================================================
+v11.0 CHANGES (from v10.1):
+[REL #1] Mormon and Jewish added to the religion modifier system.
+         driver_display_names CTE adds 'Mormon' and 'Jewish' STRUCTs (so
+         they can render in tipping condition driver slots), and gains
+         display_name_bare entries for both. The religion modifier inner
+         CASE in all 7 explanation categories (Clear Noncomp, Peripheral
+         Noncomp, Core 4a, Core 4b, Strong Comp, Conditional Comp,
+         Marginal) extends from a 2-way Catholic/Evangelical pick to an
+         explicit 4-way CASE that also handles Mormon and Jewish. The
+         outer gate (religion_driver != 'None') is unchanged.
+[REL #2] cohort_overrepresentation comment updated to note that Mormon
+         and Jewish are also excluded (handled by religion modifier),
+         consistent with the existing Catholic/Evangelical treatment.
+         No structural change to the CTE itself — the unpivot inclusion
+         list still covers only the 9 non-religious cohorts.
+[REL #3] final_output gains 4 pass-through columns: pct_mormon,
+         pct_jewish, idx_mormon_vs_state, idx_jewish_vs_state.
+         Output column count: 47 -> 51.
+
+         Requires: Step 3 v2.2+ (provides the new pct_*, idx_*_vs_state
+         columns and a religion_driver field that can take values
+         'Mormon' and 'Jewish' in addition to 'Catholic' / 'Evangelical' /
+         'None').
+
 Purpose:
 Reads the Step 3 analytics table and produces a human-readable final
 report with natural-language tipping-point explanations for every
@@ -367,6 +391,8 @@ WHEN 'Natam' THEN 'Native American'
 WHEN 'White' THEN 'White'
 WHEN 'Catholic' THEN 'Catholic'
 WHEN 'Evangelical' THEN 'Evangelical'
+WHEN 'Mormon' THEN 'Mormon'
+WHEN 'Jewish' THEN 'Jewish'
 END AS display_name_bare
 FROM UNNEST([
 -- Consolidated age buckets
@@ -385,7 +411,9 @@ STRUCT('White', 'White voters'),
 -- Religion drivers: consumed only by tipping_condition_display CTE.
 -- Cannot appear in primary/secondary/tertiary trend driver slots.
 STRUCT('Catholic', 'Catholic voters'),
-STRUCT('Evangelical', 'Evangelical voters')
+STRUCT('Evangelical', 'Evangelical voters'),
+STRUCT('Mormon', 'Mormon voters'),
+STRUCT('Jewish', 'Jewish voters')
 ])
 ),
 --======================================================================
@@ -1241,8 +1269,12 @@ LEFT JOIN driver_display_names d3 ON a.tertiary_trend_driver = d3.raw_name
 --
 -- Unpivots 9 demographic index/share pairs per district to identify
 -- cohorts that are notably overrepresented relative to the state
--- average. Excludes Female (near-parity everywhere), Catholic, and
--- Evangelical (handled by religion modifier).
+-- average. Excludes Female (near-parity everywhere), and all four
+-- religion cohorts -- Catholic, Evangelical, Mormon, Jewish -- which
+-- are handled by the religion modifier system.
+-- [v10.2 REL #2] Mormon and Jewish added to the exclusion list,
+-- consistent with the existing Catholic/Evangelical treatment.
+-- No change to the unpivot inclusion list itself.
 --
 -- Two output modes:
 -- (a) Overrepresentation: up to 3 cohorts where idx >= 1.10 AND
@@ -1451,7 +1483,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -1634,7 +1668,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -1715,7 +1751,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -1865,7 +1903,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -2033,7 +2073,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -2316,7 +2358,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -2572,7 +2616,9 @@ c.religion_driver,
 FORMAT('%.0f',
 CASE
 WHEN c.religion_driver = 'Catholic' THEN c.idx_catholic_vs_state * 100
-ELSE c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Evangelical' THEN c.idx_evangelical_vs_state * 100
+WHEN c.religion_driver = 'Mormon' THEN c.idx_mormon_vs_state * 100
+WHEN c.religion_driver = 'Jewish' THEN c.idx_jewish_vs_state * 100
 END),
 '% of the state average.')
 ELSE ''
@@ -2587,7 +2633,10 @@ USING (state, chamber, district_number)
 ),
 --======================================================================
 -- 5. FINAL OUTPUT
--- (47 columns: 33 carry-over + 12 added pass-through + 2 generated)
+-- (51 columns: 33 carry-over + 16 added pass-through + 2 generated)
+--
+-- [v11.0 REL #3] +4 pass-through fields: pct_mormon, pct_jewish,
+-- idx_mormon_vs_state, idx_jewish_vs_state. Total 47 -> 51.
 --
 -- [v6.0 REV #30] Output field changes:
 -- Removed: religion_driver_scenario_exposure_value (-1).
@@ -2650,12 +2699,15 @@ pct_black,
 pct_latino,
 pct_asian,
 -- [v6.0 REV #30] Additional raw demographic shares (pass-through from Step 3)
+-- [v11.0 REL #3] pct_mormon and pct_jewish added.
 pct_natam,
 pct_nonwhite,
 pct_college,
 pct_high_school_only,
 pct_catholic,
 pct_evangelical,
+pct_mormon,
+pct_jewish,
 pct_female,
 pct_youth_18_34,
 pct_senior_65plus,
@@ -2672,6 +2724,9 @@ idx_college_vs_state,
 idx_catholic_vs_state,
 idx_evangelical_vs_state,
 -- [v6.0 REV #30] Additional demographic indices (pass-through from Step 3)
+-- [v11.0 REL #3] idx_mormon_vs_state and idx_jewish_vs_state added.
+idx_mormon_vs_state,
+idx_jewish_vs_state,
 idx_natam_vs_state,
 idx_female_vs_state,
 -- [v6.0 REV #30] Tipping-condition diagnostic fields (pass-through from Step 3)
