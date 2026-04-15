@@ -1,0 +1,337 @@
+/*
+================================================================================
+SCENARIO GENERATOR (LONG FORMAT)
+================================================================================
+
+================================================================================
+v3.0
+================================================================================
+CHANGES FROM v2.3:
+  Structural-only addition: delta_mormon and delta_jewish columns added to
+  the pivoted output, mirroring the catholic/evangelical pattern. No new
+  scenario rows in the inputs CTE -- all existing scenarios will produce
+  0.0 for both new columns.
+
+  Purpose: lets the downstream district_trends_2026 pipeline (Step 1 v60.3+,
+  Step 3 v2.2+, Step 4 v10.2+) compile and run with Mormon and Jewish
+  indicators flowing through end-to-end. Once validated, future scenarios
+  can use 'mormon' and 'jewish' as metric keys in the inputs CTE without
+  any further structural changes.
+  
+  CHANGES FROM v2.2:
+  Expanded from 12/12/12 to 16/16/16 (48 total scenarios) to address gaps in
+  the scenario possibility space:
+
+  NEW OFFENSE (4):
+  - offense_HSonly_+.05 (working-class recapture via economic populism;
+    fills gap where Dems only gained among Dem-leaning groups)
+  - offense_Age65+_+.03 (senior recapture via entitlement defense messaging)
+  - offense_Men_+.03 (gender gap narrowing from Dem side — previously men
+    could only drift GOP)
+  - offense_Black_+.05 (standalone Black mobilization — previously only in
+    compound POC packages)
+
+  NEW DEFENSE (4):
+  - defense_Black_-.05 (standalone Black erosion — biggest single gap in v2.2;
+    2024 showed measurable Black male drift toward GOP)
+  - defense_College_-.03 (college-educated retreat — previously college voters
+    could only move Dem-ward; VA 2021 showed partial reversal possible)
+  - defense_Hisp_-.10 (large-magnitude Hispanic collapse — mirrors +.10
+    magnitude on offense side; fixes asymmetric magnitude range)
+  - defense_Women_-.03 (gender gap narrowing via Dem losses among women —
+    previously gap could only widen)
+
+  NEW BALANCED (4):
+  - balanced_Black_+.05_Hisp_-.05 (Black/Hispanic divergence — captures
+    intra-coalition fracture; these groups on divergent trajectories)
+  - balanced_HSonly_+.03_College_-.03 (education depolarization — tests
+    partial reversal of dominant 2016-2024 trend)
+  - balanced_Male_+.02_Female_-.02 (gender gap narrowing — what if gap
+    contracts rather than expands)
+  - balanced_Age18_34_-.03_Age65+_+.03 (age depolarization — youth
+    disillusionment + senior return; net-Dem in older states like NH)
+
+CARRIED FORWARD FROM v2.2:
+  - All v2.1 changes (removed 3 implausible religious offense, added 3
+    replacement offense, renamed College+Women)
+  - All v2.2 changes (removed 3 redundant defense, added 2 balanced + 1
+    offense + 1 defense)
+
+SCENARIO COUNTS: 16 Balanced (incl Baseline) + 16 Offense + 16 Defense = 48
+
+RELIGIOUS LEVER INVENTORY (3 scenarios):
+  balanced_Catholic_+.05_Evang_-.05     (catholic +, evangelical -)
+  defense_Catholic_-.05                  (catholic -)
+  defense_White_-.03_Evangelical_-.05    (evangelical -)
+================================================================================
+
+How to use:
+1. Scroll to the `inputs` CTE below.
+2. Add rows using the format: SELECT 'Scenario_Name', 'Metric_Key', Value
+3. Only list metrics that CHANGE. Everything else defaults to 0.0.
+
+VALID METRIC KEYS:
+- Race: 'hisp', 'black', 'asian', 'natam', 'white'
+- Educ: 'hs_only', 'college'
+- Religion: 'catholic', 'evangelical', 'mormon', 'jewish'
+- Age: 'age_18_24', 'age_25_34', 'age_35_44', 'age_45_54', 'age_55_64',
+       'age_65_74', 'age_75_84', 'age_85_plus'
+- Gender: 'female', 'male'
+================================================================================
+*/
+
+CREATE OR REPLACE TABLE `proj-tmc-mem-fm.main.trends_2026_scenarios` AS
+
+WITH inputs AS (
+  -- ===========================================================================
+  -- 1. BASELINE (produces all zeros)
+  -- ===========================================================================
+  SELECT 'balanced_Baseline' AS scenario, 'hisp' AS metric, 0.0 AS delta
+
+  -- ===========================================================================
+  -- 2. BALANCED SCENARIOS (count 15, plus Baseline = 16)
+  -- ===========================================================================
+
+  UNION ALL SELECT 'balanced_HSonly_-.05_POC_+.05', 'hs_only', -.05
+  UNION ALL SELECT 'balanced_HSonly_-.05_POC_+.05', 'hisp',    .05
+  UNION ALL SELECT 'balanced_HSonly_-.05_POC_+.05', 'black',   .05
+  UNION ALL SELECT 'balanced_HSonly_-.05_POC_+.05', 'asian',   .05
+  UNION ALL SELECT 'balanced_HSonly_-.05_POC_+.05', 'natam',   .05
+
+  UNION ALL SELECT 'balanced_College_+.05_HSonly_-.05', 'college',  .05
+  UNION ALL SELECT 'balanced_College_+.05_HSonly_-.05', 'hs_only', -.05
+
+  UNION ALL SELECT 'balanced_College_+.05_POC_-.05', 'college',  .05
+  UNION ALL SELECT 'balanced_College_+.05_POC_-.05', 'hisp',    -.05
+  UNION ALL SELECT 'balanced_College_+.05_POC_-.05', 'black',   -.05
+  UNION ALL SELECT 'balanced_College_+.05_POC_-.05', 'asian',   -.05
+  UNION ALL SELECT 'balanced_College_+.05_POC_-.05', 'natam',   -.05
+
+  UNION ALL SELECT 'balanced_Black_+.05_Hisp_and_Asian_-.05', 'hisp',  -.05
+  UNION ALL SELECT 'balanced_Black_+.05_Hisp_and_Asian_-.05', 'black',  .05
+  UNION ALL SELECT 'balanced_Black_+.05_Hisp_and_Asian_-.05', 'asian', -.05
+
+  UNION ALL SELECT 'balanced_POC_+.05_College_+.05,HSonly_-.05', 'hisp',    .05
+  UNION ALL SELECT 'balanced_POC_+.05_College_+.05,HSonly_-.05', 'black',   .05
+  UNION ALL SELECT 'balanced_POC_+.05_College_+.05,HSonly_-.05', 'asian',   .05
+  UNION ALL SELECT 'balanced_POC_+.05_College_+.05,HSonly_-.05', 'natam',   .05
+  UNION ALL SELECT 'balanced_POC_+.05_College_+.05,HSonly_-.05', 'college', .05
+  UNION ALL SELECT 'balanced_POC_+.05_College_+.05,HSonly_-.05', 'hs_only', -.05
+
+  UNION ALL SELECT 'balanced_Catholic_+.05_Evang_-.05', 'catholic',     .05
+  UNION ALL SELECT 'balanced_Catholic_+.05_Evang_-.05', 'evangelical', -.05
+
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05', 'age_18_24',     .05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05', 'age_25_34',     .05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05', 'age_35_44',     .05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05',  'age_45_54',   -.05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05',  'age_55_64',   -.05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05',  'age_65_74',   -.05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05',  'age_75_84',   -.05
+  UNION ALL SELECT 'balanced_Age18_44_+.05_Age45+_-.05', 'age_85_plus',  -.05
+
+  UNION ALL SELECT 'balanced_Age18_34_+.05_POC_+.05_HSonly_-.01', 'age_18_24',.05
+  UNION ALL SELECT 'balanced_Age18_34_+.05_POC_+.05_HSonly_-.01', 'age_25_34',.05
+  UNION ALL SELECT 'balanced_Age18_34_+.05_POC_+.05_HSonly_-.01', 'hisp',     .05
+  UNION ALL SELECT 'balanced_Age18_34_+.05_POC_+.05_HSonly_-.01', 'black',    .05
+  UNION ALL SELECT 'balanced_Age18_34_+.05_POC_+.05_HSonly_-.01', 'asian',    .05
+  UNION ALL SELECT 'balanced_Age18_34_+.05_POC_+.05_HSonly_-.01', 'hs_only', -.01
+
+  UNION ALL SELECT 'balanced_Age65+_+.05_White_+.03_College_-.03', 'age_65_74',    .05
+  UNION ALL SELECT 'balanced_Age65+_+.05_White_+.03_College_-.03', 'age_75_84',    .05
+  UNION ALL SELECT 'balanced_Age65+_+.05_White_+.03_College_-.03', 'age_85_plus',  .05
+  UNION ALL SELECT 'balanced_Age65+_+.05_White_+.03_College_-.03', 'white',        .03
+  UNION ALL SELECT 'balanced_Age65+_+.05_White_+.03_College_-.03', 'college',     -.01
+
+  -- [v2.2] Education-gender polarization
+  UNION ALL SELECT 'balanced_College_+.02_Female_+.02_HSonly_-.02_Male_-.02', 'college', .02
+  UNION ALL SELECT 'balanced_College_+.02_Female_+.02_HSonly_-.02_Male_-.02', 'female',  .02
+  UNION ALL SELECT 'balanced_College_+.02_Female_+.02_HSonly_-.02_Male_-.02', 'hs_only', -.02
+  UNION ALL SELECT 'balanced_College_+.02_Female_+.02_HSonly_-.02_Male_-.02', 'male',    -.02
+
+  -- [v2.2] Racial depolarization
+  UNION ALL SELECT 'balanced_White_+.02_POC_-.02', 'white', .02
+  UNION ALL SELECT 'balanced_White_+.02_POC_-.02', 'hisp',  -.02
+  UNION ALL SELECT 'balanced_White_+.02_POC_-.02', 'black',  -.02
+  UNION ALL SELECT 'balanced_White_+.02_POC_-.02', 'asian',  -.02
+  UNION ALL SELECT 'balanced_White_+.02_POC_-.02', 'natam',  -.02
+
+  -- [v2.3] Black/Hispanic divergence (intra-coalition fracture)
+  UNION ALL SELECT 'balanced_Black_+.05_Hisp_-.05', 'black', .05
+  UNION ALL SELECT 'balanced_Black_+.05_Hisp_-.05', 'hisp',  -.05
+
+  -- [v2.3] Education depolarization (partial reversal of 2016-2024 trend)
+  UNION ALL SELECT 'balanced_HSonly_+.03_College_-.03', 'hs_only', .03
+  UNION ALL SELECT 'balanced_HSonly_+.03_College_-.03', 'college', -.03
+
+  -- [v2.3] Gender gap narrowing (men shift Dem, women shift GOP)
+  UNION ALL SELECT 'balanced_Male_+.02_Female_-.02', 'male',   .02
+  UNION ALL SELECT 'balanced_Male_+.02_Female_-.02', 'female', -.02
+
+  -- [v2.3] Age depolarization (youth disillusionment + senior return)
+  UNION ALL SELECT 'balanced_Age18_34_-.03_Age65+_+.03', 'age_18_24',   -.03
+  UNION ALL SELECT 'balanced_Age18_34_-.03_Age65+_+.03', 'age_25_34',   -.03
+  UNION ALL SELECT 'balanced_Age18_34_-.03_Age65+_+.03', 'age_65_74',    .03
+  UNION ALL SELECT 'balanced_Age18_34_-.03_Age65+_+.03', 'age_75_84',    .03
+  UNION ALL SELECT 'balanced_Age18_34_-.03_Age65+_+.03', 'age_85_plus',  .03
+
+  -- ===========================================================================
+  -- 3. OFFENSE SCENARIOS (count 16)
+  -- ===========================================================================
+
+  UNION ALL SELECT 'offense_College_+.05', 'college', .05
+
+  UNION ALL SELECT 'offense_Hisp_+.05', 'hisp',  .05
+
+  UNION ALL SELECT 'offense_Women_+.04', 'female', .04
+
+  UNION ALL SELECT 'offense_Age18_34_+.05', 'age_18_24', .05
+  UNION ALL SELECT 'offense_Age18_34_+.05', 'age_25_34', .05
+
+  UNION ALL SELECT 'offense_Black_+.05_Women_+.03', 'black',  .05
+  UNION ALL SELECT 'offense_Black_+.05_Women_+.03', 'female', .03
+
+  UNION ALL SELECT 'offense_White_+.02_HSonly_+.02', 'hs_only', .02
+  UNION ALL SELECT 'offense_White_+.02_HSonly_+.02', 'white',   .02
+
+  UNION ALL SELECT 'offense_Hisp_+.10_Other_POC_+.05', 'hisp',  .10
+  UNION ALL SELECT 'offense_Hisp_+.10_Other_POC_+.05', 'black', .05
+  UNION ALL SELECT 'offense_Hisp_+.10_Other_POC_+.05', 'asian', .05
+  UNION ALL SELECT 'offense_Hisp_+.10_Other_POC_+.05', 'natam', .05
+
+  UNION ALL SELECT 'offense_College_+.05_Hisp_+.10_Other_POC_+.05', 'college', .05
+  UNION ALL SELECT 'offense_College_+.05_Hisp_+.10_Other_POC_+.05', 'hisp',  .10
+  UNION ALL SELECT 'offense_College_+.05_Hisp_+.10_Other_POC_+.05', 'black', .05
+  UNION ALL SELECT 'offense_College_+.05_Hisp_+.10_Other_POC_+.05', 'asian', .05
+  UNION ALL SELECT 'offense_College_+.05_Hisp_+.10_Other_POC_+.05', 'natam', .05
+
+  UNION ALL SELECT 'offense_College_+.05_Women_+.02', 'college', .05
+  UNION ALL SELECT 'offense_College_+.05_Women_+.02', 'female',  .02
+
+  UNION ALL SELECT 'offense_POC_+.05_Age18_34_+.05', 'hisp',      .05
+  UNION ALL SELECT 'offense_POC_+.05_Age18_34_+.05', 'black',     .05
+  UNION ALL SELECT 'offense_POC_+.05_Age18_34_+.05', 'asian',     .05
+  UNION ALL SELECT 'offense_POC_+.05_Age18_34_+.05', 'natam',     .05
+  UNION ALL SELECT 'offense_POC_+.05_Age18_34_+.05', 'age_18_24', .05
+  UNION ALL SELECT 'offense_POC_+.05_Age18_34_+.05', 'age_25_34', .05
+
+  UNION ALL SELECT 'offense_Asian_+.10', 'asian', .10
+
+  UNION ALL SELECT 'offense_All_Combined', 'hisp',      .10
+  UNION ALL SELECT 'offense_All_Combined', 'black',     .05
+  UNION ALL SELECT 'offense_All_Combined', 'asian',     .10
+  UNION ALL SELECT 'offense_All_Combined', 'natam',     .05
+  UNION ALL SELECT 'offense_All_Combined', 'college',   .05
+  UNION ALL SELECT 'offense_All_Combined', 'age_18_24', .05
+  UNION ALL SELECT 'offense_All_Combined', 'age_25_34', .02
+  UNION ALL SELECT 'offense_All_Combined', 'female',    .01
+
+  -- [v2.3] Working-class recapture (economic populism)
+  UNION ALL SELECT 'offense_HSonly_+.05', 'hs_only', .05
+
+  -- [v2.3] Senior recapture (entitlement defense messaging)
+  UNION ALL SELECT 'offense_Age65+_+.03', 'age_65_74',   .03
+  UNION ALL SELECT 'offense_Age65+_+.03', 'age_75_84',   .03
+  UNION ALL SELECT 'offense_Age65+_+.03', 'age_85_plus', .03
+
+  -- [v2.3] Gender gap narrowing from Dem side (men shift toward Dems)
+  UNION ALL SELECT 'offense_Men_+.03', 'male', .03
+
+  -- [v2.3] Standalone Black mobilization (targeted organizing, high-salience)
+  UNION ALL SELECT 'offense_Black_+.05', 'black', .05
+
+  -- ===========================================================================
+  -- 4. DEFENSE SCENARIOS (count 16)
+  -- ===========================================================================
+
+  UNION ALL SELECT 'defense_Hisp_-.05_Black_-.02_Asian_-.05', 'hisp',  -.05
+  UNION ALL SELECT 'defense_Hisp_-.05_Black_-.02_Asian_-.05', 'black', -.02
+  UNION ALL SELECT 'defense_Hisp_-.05_Black_-.02_Asian_-.05', 'asian', -.05
+
+  UNION ALL SELECT 'defense_HSonly_-.05', 'hs_only', -.05
+
+  UNION ALL SELECT 'defense_Hisp_-.05', 'hisp', -.05
+
+  UNION ALL SELECT 'defense_Catholic_-.05', 'catholic', -.05
+
+  UNION ALL SELECT 'defense_POC_-.05_College_-.05', 'hisp',    -.05
+  UNION ALL SELECT 'defense_POC_-.05_College_-.05', 'black',   -.05
+  UNION ALL SELECT 'defense_POC_-.05_College_-.05', 'asian',   -.05
+  UNION ALL SELECT 'defense_POC_-.05_College_-.05', 'natam',   -.05
+  UNION ALL SELECT 'defense_POC_-.05_College_-.05', 'college', -.05
+
+  UNION ALL SELECT 'defense_White_-.03_Evangelical_-.05', 'white',       -.03
+  UNION ALL SELECT 'defense_White_-.03_Evangelical_-.05', 'evangelical', -.05
+
+  UNION ALL SELECT 'defense_White_-.03_HSonly_-.05', 'white',   -.03
+  UNION ALL SELECT 'defense_White_-.03_HSonly_-.05', 'hs_only', -.05
+
+  UNION ALL SELECT 'defense_HSonly_-.05_Men_-.03', 'hs_only', -.05
+  UNION ALL SELECT 'defense_HSonly_-.05_Men_-.03', 'male',    -.03
+
+  UNION ALL SELECT 'defense_Age_45_64_-.02_Age_65_Plus_-.04',  'age_45_54',   -.02
+  UNION ALL SELECT 'defense_Age_45_64_-.02_Age_65_Plus_-.04',  'age_55_64',   -.02
+  UNION ALL SELECT 'defense_Age_45_64_-.02_Age_65_Plus_-.04',  'age_65_74',   -.04
+  UNION ALL SELECT 'defense_Age_45_64_-.02_Age_65_Plus_-.04',  'age_75_84',   -.04
+  UNION ALL SELECT 'defense_Age_45_64_-.02_Age_65_Plus_-.04', 'age_85_plus',  -.04
+
+  UNION ALL SELECT 'defense_Mixed_Composite', 'hisp',      -.05
+  UNION ALL SELECT 'defense_Mixed_Composite', 'black',     -.05
+  UNION ALL SELECT 'defense_Mixed_Composite', 'asian',     -.05
+  UNION ALL SELECT 'defense_Mixed_Composite', 'natam',     -.05
+  UNION ALL SELECT 'defense_Mixed_Composite', 'age_18_24', -.02
+  UNION ALL SELECT 'defense_Mixed_Composite', 'age_25_34', -.02
+  UNION ALL SELECT 'defense_Mixed_Composite', 'male',      -.04
+
+  UNION ALL SELECT 'defense_Age18-34_-.05', 'age_18_24', -.05
+  UNION ALL SELECT 'defense_Age18-34_-.05', 'age_25_34', -.05
+
+  UNION ALL SELECT 'defense_Men_-.04', 'male', -.04
+
+  -- [v2.3] Standalone Black erosion (2024 Black male drift toward GOP)
+  UNION ALL SELECT 'defense_Black_-.05', 'black', -.05
+
+  -- [v2.3] College-educated retreat (suburban backlash, VA 2021 preview)
+  UNION ALL SELECT 'defense_College_-.03', 'college', -.03
+
+  -- [v2.3] Large-magnitude Hispanic collapse (mirrors +.10 on offense side)
+  UNION ALL SELECT 'defense_Hisp_-.10', 'hisp', -.10
+
+  -- [v2.3] Gender gap narrowing via Dem losses among women
+  UNION ALL SELECT 'defense_Women_-.03', 'female', -.03
+),
+
+-- =============================================================================
+-- LOGIC: PIVOT ROWS TO COLUMNS
+-- =============================================================================
+pivoted AS (
+  SELECT
+    scenario AS name,
+    COALESCE(SUM(CASE WHEN metric = 'hisp'        THEN delta END), 0.0) AS delta_hisp,
+    COALESCE(SUM(CASE WHEN metric = 'black'       THEN delta END), 0.0) AS delta_black,
+    COALESCE(SUM(CASE WHEN metric = 'asian'       THEN delta END), 0.0) AS delta_asian,
+    COALESCE(SUM(CASE WHEN metric = 'natam'       THEN delta END), 0.0) AS delta_natam,
+    COALESCE(SUM(CASE WHEN metric = 'white'       THEN delta END), 0.0) AS delta_white,
+    COALESCE(SUM(CASE WHEN metric = 'hs_only'     THEN delta END), 0.0) AS delta_high_school_only,
+    COALESCE(SUM(CASE WHEN metric = 'college'     THEN delta END), 0.0) AS delta_college,
+    COALESCE(SUM(CASE WHEN metric = 'catholic'    THEN delta END), 0.0) AS delta_catholic,
+    COALESCE(SUM(CASE WHEN metric = 'evangelical' THEN delta END), 0.0) AS delta_evangelical,
+    COALESCE(SUM(CASE WHEN metric = 'mormon'      THEN delta END), 0.0) AS delta_mormon,
+    COALESCE(SUM(CASE WHEN metric = 'jewish'      THEN delta END), 0.0) AS delta_jewish,
+    COALESCE(SUM(CASE WHEN metric = 'age_18_24'   THEN delta END), 0.0) AS delta_age_18_24,
+    COALESCE(SUM(CASE WHEN metric = 'age_25_34'   THEN delta END), 0.0) AS delta_age_25_34,
+    COALESCE(SUM(CASE WHEN metric = 'age_35_44'   THEN delta END), 0.0) AS delta_age_35_44,
+    COALESCE(SUM(CASE WHEN metric = 'age_45_54'   THEN delta END), 0.0) AS delta_age_45_54,
+    COALESCE(SUM(CASE WHEN metric = 'age_55_64'   THEN delta END), 0.0) AS delta_age_55_64,
+    COALESCE(SUM(CASE WHEN metric = 'age_65_74'   THEN delta END), 0.0) AS delta_age_65_74,
+    COALESCE(SUM(CASE WHEN metric = 'age_75_84'   THEN delta END), 0.0) AS delta_age_75_84,
+    COALESCE(SUM(CASE WHEN metric = 'age_85_plus' THEN delta END), 0.0) AS delta_age_85_plus,
+    COALESCE(SUM(CASE WHEN metric = 'female'      THEN delta END), 0.0) AS delta_female,
+    COALESCE(SUM(CASE WHEN metric = 'male'        THEN delta END), 0.0) AS delta_male
+  FROM inputs
+  GROUP BY 1
+)
+
+SELECT * FROM pivoted ORDER BY name;
+
+--END OF MAKE SCENARIOS TABLE
