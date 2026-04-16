@@ -1,6 +1,6 @@
 /*
   district_trends_2026_step1
-  v61.0
+  v61.1
   adapted from
   trends_2025_district_step2_core_2030_model
   v1.3-EV
@@ -83,13 +83,14 @@
 DECLARE diagnostic_mode BOOL DEFAULT FALSE;              -- TRUE FOR DIAGNOSTICS: only balanced_Baseline @ swing 0
 DECLARE make_table_mode BOOL DEFAULT TRUE;               -- FALSE FOR DIAGNOSTICS: SELECT to console instead of writing table
 DECLARE export_weighted_demographics BOOL DEFAULT TRUE;  -- Writes weighted_demo_shares, required by Step 3
+DECLARE export_migration_profiles BOOL DEFAULT TRUE;     -- Writes migration_profiles, joined by Step 3
 
 -- CONFIGURATION
 DECLARE target_states ARRAY<STRING> DEFAULT
 ['AK','AZ','FL','GA','IA','KS','ME','MI','MN','NC','NH','NV','OH','PA','TX','VA','WI'];
 --['GA','OH']; <--SET DIAGNOSTIC STATES
 
-DECLARE target_district_level STRING DEFAULT 'SD'; -- 'HD' or 'SD'
+DECLARE target_district_level STRING DEFAULT 'HD'; -- 'HD' or 'SD'
 
 -- Uniform swings as integer percentage points (e.g., -6 = 6 pts against Dems).
 -- Stored as INT64 through pipeline output; divide by 100 only at display time
@@ -528,14 +529,32 @@ WITH
              AND LPAD(CAST(s.vb_vf_county_code AS STRING), 3, '0')
                  != LPAD(CAST(s.vb_tsmart_county_code AS STRING), 3, '0')
         THEN 1.0
-        WHEN s.vb_tsmart_address_improvement_type IN (1, 2, 5, 6)
+WHEN s.vb_tsmart_address_improvement_type IN (1, 2, 5, 6)
              AND s.vb_tsmart_effective_date >= CAST(
                FORMAT_DATE('%Y%m', DATE_SUB(CURRENT_DATE(), INTERVAL 5 YEAR))
                AS INT64)
              AND s.effective_age >= 23
         THEN 1.0
         ELSE 0.0
-      END AS is_meaningful_mover
+      END AS is_meaningful_mover,
+
+      -- [MIGRATION] BROAD IN-MOVER FLAG (for migration_profiles aggregation)
+      -- Broader than is_meaningful_mover above. Used solely for characterizing
+      -- the demographic profile of recent in-movers to each district; NOT used
+      -- for partisan offset. Captures any voter whose file mover_status
+      -- indicates recent relocation, regardless of distance or verified
+      -- cross-county origin. Null/blank statuses and 'Resides at Current
+      -- Address' both resolve to 0.
+      CASE
+        WHEN s.vb_voterbase_mover_status IN (
+          'Moved within County',
+          'Moved within State',
+          'Moved out of State',
+          'Moved Left No Address',
+          'Probable Move'
+        ) THEN 1.0
+        ELSE 0.0
+      END AS is_inmover_5yr
 
     FROM scaled s
     -- [EV #1] Join county age probabilities for fractional age flags
@@ -1162,6 +1181,7 @@ WITH
       maturation_factor,
       raw_mover_factor,
       mover_impact_fraction,
+      is_inmover_5yr,  -- [MIGRATION] carry through for Part 3 aggregation
 
       -- EFFECTIVE MIGRATION SURVIVAL (with floor)
       CASE
@@ -1540,6 +1560,7 @@ ORDER BY
 BEGIN
   DECLARE output_table_name STRING;
   DECLARE demo_table_name STRING;
+  DECLARE migration_table_name STRING;  -- [MIGRATION]
 
   IF make_table_mode THEN
     IF target_district_level = 'HD' THEN
@@ -1592,6 +1613,296 @@ BEGIN
       """, demo_table_name);
 
       SELECT format('Successfully created weighted demographics table: %s', demo_table_name) as status;
+
+    END IF;
+
+    -- =====================================================================
+    -- [MIGRATION] Migration profiles export
+    -- Computes per-district in-mover vs out-mover demographic deltas plus a
+    -- dominance classification for the partisan delta. Five surface fields;
+    -- contribution decomposition kept internal.
+    --   Topline gate:   |partisan Δ| >= 0.25 pp
+    --   Dominance:      |contribution| / |topline| >= 0.65 with sign match
+    --   Cohort gate:    race sub-group eligible only if electorate share >= 3%
+    --   Priority:       sub-group > voters_of_color > education > age
+    -- In-mover weight  = expected_individual_vote × is_inmover_5yr
+    -- Out-mover weight = replacement_mover_weight (model's own departure-prob
+    --                    × turnout, already scaled by mover_impact_fraction)
+    -- =====================================================================
+    IF export_migration_profiles THEN
+      IF target_district_level = 'HD' THEN
+        SET migration_table_name = 'proj-tmc-mem-fm.main.trends_2025_migration_profiles_hd';
+      ELSE
+        SET migration_table_name = 'proj-tmc-mem-fm.main.trends_2025_migration_profiles_sd';
+      END IF;
+
+      EXECUTE IMMEDIATE format("""
+        CREATE OR REPLACE TABLE `%s` AS
+
+        WITH
+
+          -- State-level turnout-weighted partisan averages by demographic band.
+          -- Used as the pivot in the contribution decomposition: the partisan
+          -- level "attributable" to membership in each cohort, holding the rest
+          -- of the state as reference. Partisan measure = partisanship_prob_all
+          -- (global_all-adjusted) to match downstream model internals.
+          state_priors AS (
+            SELECT
+              state,
+
+              -- Race priors (probability-weighted)
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_hisp  * partisanship_prob_all),
+                          SUM(expected_individual_vote * p_hisp))  AS sp_latino,
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_black * partisanship_prob_all),
+                          SUM(expected_individual_vote * p_black)) AS sp_black,
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_asian * partisanship_prob_all),
+                          SUM(expected_individual_vote * p_asian)) AS sp_asian,
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_natam * partisanship_prob_all),
+                          SUM(expected_individual_vote * p_natam)) AS sp_natam,
+
+              -- Education priors
+              SAFE_DIVIDE(SUM(expected_individual_vote * college_prob          * partisanship_prob_all),
+                          SUM(expected_individual_vote * college_prob))          AS sp_college,
+              SAFE_DIVIDE(SUM(expected_individual_vote * high_school_only_prob * partisanship_prob_all),
+                          SUM(expected_individual_vote * high_school_only_prob)) AS sp_hs_only,
+
+              -- Age priors (8 bands matching existing flag schema)
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_18_24_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_18_24_flag))  AS sp_age_18_24,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_25_34_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_25_34_flag))  AS sp_age_25_34,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_35_44_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_35_44_flag))  AS sp_age_35_44,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_45_54_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_45_54_flag))  AS sp_age_45_54,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_55_64_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_55_64_flag))  AS sp_age_55_64,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_65_74_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_65_74_flag))  AS sp_age_65_74,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_75_84_flag  * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_75_84_flag))  AS sp_age_75_84,
+              SAFE_DIVIDE(SUM(expected_individual_vote * age_85_plus_flag * partisanship_prob_all),
+                          SUM(expected_individual_vote * age_85_plus_flag)) AS sp_age_85_plus
+            FROM _weighted_voters
+            GROUP BY state
+          ),
+
+          -- Per-district in-mover and out-mover demographic aggregates,
+          -- plus electorate race shares used for the 3%% eligibility gate.
+          district_profiles AS (
+            SELECT
+              state, district_level, district_number,
+
+              -- In-mover totals and profile
+              SUM(expected_individual_vote * is_inmover_5yr) AS in_total_weight,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * partisanship_prob_all),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_avg_partisan,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * p_hisp),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_p_latino,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * p_black),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_p_black,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * p_asian),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_p_asian,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * p_natam),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_p_natam,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * p_white),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_p_white,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * college_prob),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_pct_college,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * high_school_only_prob),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_pct_hs_only,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * effective_age),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_avg_age,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_18_24_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_18_24,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_25_34_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_25_34,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_35_44_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_35_44,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_45_54_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_45_54,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_55_64_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_55_64,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_65_74_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_65_74,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_75_84_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_75_84,
+              SAFE_DIVIDE(SUM(expected_individual_vote * is_inmover_5yr * age_85_plus_flag),
+                          SUM(expected_individual_vote * is_inmover_5yr)) AS in_age_85_plus,
+
+              -- Out-mover totals and profile (weighted by replacement_mover_weight,
+              -- which = turnout × departure_prob × mover_impact_fraction)
+              SUM(replacement_mover_weight) AS out_total_weight,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * partisanship_prob_all),
+                          SUM(replacement_mover_weight)) AS out_avg_partisan,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * p_hisp),
+                          SUM(replacement_mover_weight)) AS out_p_latino,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * p_black),
+                          SUM(replacement_mover_weight)) AS out_p_black,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * p_asian),
+                          SUM(replacement_mover_weight)) AS out_p_asian,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * p_natam),
+                          SUM(replacement_mover_weight)) AS out_p_natam,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * p_white),
+                          SUM(replacement_mover_weight)) AS out_p_white,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * college_prob),
+                          SUM(replacement_mover_weight)) AS out_pct_college,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * high_school_only_prob),
+                          SUM(replacement_mover_weight)) AS out_pct_hs_only,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * effective_age),
+                          SUM(replacement_mover_weight)) AS out_avg_age,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_18_24_flag),
+                          SUM(replacement_mover_weight)) AS out_age_18_24,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_25_34_flag),
+                          SUM(replacement_mover_weight)) AS out_age_25_34,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_35_44_flag),
+                          SUM(replacement_mover_weight)) AS out_age_35_44,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_45_54_flag),
+                          SUM(replacement_mover_weight)) AS out_age_45_54,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_55_64_flag),
+                          SUM(replacement_mover_weight)) AS out_age_55_64,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_65_74_flag),
+                          SUM(replacement_mover_weight)) AS out_age_65_74,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_75_84_flag),
+                          SUM(replacement_mover_weight)) AS out_age_75_84,
+              SAFE_DIVIDE(SUM(replacement_mover_weight * age_85_plus_flag),
+                          SUM(replacement_mover_weight)) AS out_age_85_plus,
+
+              -- Electorate race shares (for dominance eligibility gate)
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_hisp),
+                          SUM(expected_individual_vote)) AS elec_pct_latino,
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_black),
+                          SUM(expected_individual_vote)) AS elec_pct_black,
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_asian),
+                          SUM(expected_individual_vote)) AS elec_pct_asian,
+              SAFE_DIVIDE(SUM(expected_individual_vote * p_natam),
+                          SUM(expected_individual_vote)) AS elec_pct_natam
+
+            FROM _weighted_voters
+            GROUP BY state, district_level, district_number
+          ),
+
+          -- Topline deltas plus per-dimension contribution decomposition.
+          -- Each contribution = Σ_bands (share_in - share_out) × state_prior × 100
+          -- Contributions do not sum to topline exactly (interaction terms);
+          -- the dominance test is on share of |topline|, not sum of contribs.
+          with_contributions AS (
+            SELECT
+              d.*,
+
+              -- Surface deltas (output)
+              (d.in_avg_partisan - d.out_avg_partisan) * 100 AS migration_partisan_delta_pp,
+              ((1.0 - d.in_p_white) - (1.0 - d.out_p_white)) * 100 AS migration_nonwhite_delta_pp,
+              (d.in_pct_college - d.out_pct_college) * 100 AS migration_college_delta_pp,
+              (d.in_avg_age - d.out_avg_age) AS migration_age_delta_years,
+
+              -- Internal contributions (not surfaced; consumed by dominance CASE)
+              (d.in_p_latino - d.out_p_latino) * sp.sp_latino * 100 AS contrib_latino_pp,
+              (d.in_p_black  - d.out_p_black)  * sp.sp_black  * 100 AS contrib_black_pp,
+              (d.in_p_asian  - d.out_p_asian)  * sp.sp_asian  * 100 AS contrib_asian_pp,
+              (d.in_p_natam  - d.out_p_natam)  * sp.sp_natam  * 100 AS contrib_natam_pp,
+
+              (  (d.in_pct_college - d.out_pct_college) * sp.sp_college
+               + (d.in_pct_hs_only - d.out_pct_hs_only) * sp.sp_hs_only
+              ) * 100 AS contrib_edu_pp,
+
+              (  (d.in_age_18_24   - d.out_age_18_24)   * sp.sp_age_18_24
+               + (d.in_age_25_34   - d.out_age_25_34)   * sp.sp_age_25_34
+               + (d.in_age_35_44   - d.out_age_35_44)   * sp.sp_age_35_44
+               + (d.in_age_45_54   - d.out_age_45_54)   * sp.sp_age_45_54
+               + (d.in_age_55_64   - d.out_age_55_64)   * sp.sp_age_55_64
+               + (d.in_age_65_74   - d.out_age_65_74)   * sp.sp_age_65_74
+               + (d.in_age_75_84   - d.out_age_75_84)   * sp.sp_age_75_84
+               + (d.in_age_85_plus - d.out_age_85_plus) * sp.sp_age_85_plus
+              ) * 100 AS contrib_age_pp
+
+            FROM district_profiles d
+            LEFT JOIN state_priors sp USING (state)
+          ),
+
+          -- Eligibility and dominance pass flags for the CASE below.
+          with_flags AS (
+            SELECT
+              *,
+              (contrib_latino_pp + contrib_black_pp + contrib_asian_pp + contrib_natam_pp) AS contrib_race_pp,
+
+              (elec_pct_latino >= 0.03
+                AND SIGN(contrib_latino_pp) = SIGN(migration_partisan_delta_pp)
+                AND SAFE_DIVIDE(ABS(contrib_latino_pp),
+                                NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              ) AS latino_passes,
+              (elec_pct_black >= 0.03
+                AND SIGN(contrib_black_pp) = SIGN(migration_partisan_delta_pp)
+                AND SAFE_DIVIDE(ABS(contrib_black_pp),
+                                NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              ) AS black_passes,
+              (elec_pct_asian >= 0.03
+                AND SIGN(contrib_asian_pp) = SIGN(migration_partisan_delta_pp)
+                AND SAFE_DIVIDE(ABS(contrib_asian_pp),
+                                NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              ) AS asian_passes,
+              (elec_pct_natam >= 0.03
+                AND SIGN(contrib_natam_pp) = SIGN(migration_partisan_delta_pp)
+                AND SAFE_DIVIDE(ABS(contrib_natam_pp),
+                                NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              ) AS natam_passes
+            FROM with_contributions
+          )
+
+        SELECT
+          state,
+          district_level,
+          district_number,
+          migration_partisan_delta_pp,
+          migration_nonwhite_delta_pp,
+          migration_college_delta_pp,
+          migration_age_delta_years,
+
+          CASE
+            -- Topline gate: below 0.25 pp = no factor fires
+            WHEN ABS(migration_partisan_delta_pp) < 0.25 THEN NULL
+
+            -- Race sub-group: among those passing the test, the largest |contribution| wins.
+            -- Enumerated as pairwise comparisons so the CASE returns a literal string directly.
+            WHEN latino_passes
+              AND (NOT black_passes OR ABS(contrib_latino_pp) >= ABS(contrib_black_pp))
+              AND (NOT asian_passes OR ABS(contrib_latino_pp) >= ABS(contrib_asian_pp))
+              AND (NOT natam_passes OR ABS(contrib_latino_pp) >= ABS(contrib_natam_pp))
+              THEN 'latino'
+            WHEN black_passes
+              AND (NOT asian_passes OR ABS(contrib_black_pp) >= ABS(contrib_asian_pp))
+              AND (NOT natam_passes OR ABS(contrib_black_pp) >= ABS(contrib_natam_pp))
+              THEN 'black'
+            WHEN asian_passes
+              AND (NOT natam_passes OR ABS(contrib_asian_pp) >= ABS(contrib_natam_pp))
+              THEN 'asian'
+            WHEN natam_passes THEN 'natam'
+
+            -- Aggregate race (no single sub-group won)
+            WHEN SIGN(contrib_race_pp) = SIGN(migration_partisan_delta_pp)
+              AND SAFE_DIVIDE(ABS(contrib_race_pp),
+                              NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              THEN 'voters_of_color'
+
+            -- Education
+            WHEN SIGN(contrib_edu_pp) = SIGN(migration_partisan_delta_pp)
+              AND SAFE_DIVIDE(ABS(contrib_edu_pp),
+                              NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              THEN 'education'
+
+            -- Age
+            WHEN SIGN(contrib_age_pp) = SIGN(migration_partisan_delta_pp)
+              AND SAFE_DIVIDE(ABS(contrib_age_pp),
+                              NULLIF(ABS(migration_partisan_delta_pp), 0)) >= 0.65
+              THEN 'age'
+
+            ELSE NULL
+          END AS migration_dominant_factor
+
+        FROM with_flags
+      """, migration_table_name);
+
+      SELECT format('Successfully created migration profiles table: %s', migration_table_name) as status;
 
     END IF;
 
