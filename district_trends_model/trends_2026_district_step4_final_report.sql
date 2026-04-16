@@ -1,12 +1,38 @@
 /*
 ================================================================================
 district_trends_2026_step4_final_report
-v11.0
+v11.2
 adapted from
 trends_2025_district_step6_final_report
 v8.2
 adapted from trends_2025_step6_final_report
 ================================================================================
+v11.1 CHANGES (from v8.2):
+[REV #58] Migration sentence block:
+  New migration_sentence CTE consumes the five migration_* fields
+  added to district_analytics in Step 3 v1.5 (sourced from Step 1
+  v61.0 side-output tables). Renders a single-sentence migration
+  narrative per district using five branches:
+    Branch 1: Dominant factor fires — mechanism call-out + "also"
+              clause for other above-threshold compositional deltas.
+    Branch 2: Partisan tailwind + >= 1 compositional dim above
+              threshold — listing format.
+    Branch 3: Partisan tailwind only — bare sentence.
+    Branch 4: Compositional change without partisan effect —
+              diagnostic sentence flagging that migration is not
+              the trend mechanism.
+    Branch 5: All dimensions below threshold — omitted.
+  Thresholds: partisan >= 0.25 pp, nonwhite/college >= 2.0 pp,
+  age >= 3.0 years.
+  Dominance phrasing maps sub-group ('latino' / 'black' / 'asian' /
+  'natam'), aggregate ('voters_of_color'), 'education' (sign-aware
+  gain vs. drain language), and 'age' (direction-generic).
+  Sentence inserted between convergence/divergence block and cohort
+  overrepresentation sentence in all categories except Safe
+  Noncompetitive (half-sentence dismissal, migration adds noise).
+  NULL migration rows (zero in-movers from Step 1) produce NULL
+  sentence_text; COALESCE handles at the call site.
+
 v11.0 CHANGES (from v10.1):
 [REL #1] Mormon and Jewish added to the religion modifier system.
          driver_display_names CTE adds 'Mormon' and 'Jewish' STRUCTs (so
@@ -315,13 +341,13 @@ REV #41, otherwise unchanged)
 -- CONFIGURATION
 --==============================================================================
 -- Set to FALSE to run full 2,620-district production output.
-DECLARE diagnostic_mode BOOL DEFAULT FALSE; --TRUE for diagnostics
+DECLARE diagnostic_mode BOOL DEFAULT TRUE; --TRUE for diagnostics
 --============================================================================
 -- DIAGNOSTIC DISTRICTS BLOCK (v3)
 --============================================================================
 DECLARE diagnostic_districts ARRAY<STRUCT<state STRING, chamber STRING, district_number STRING>> DEFAULT [
 STRUCT('AK', 'hd', '005'), STRUCT('AK', 'hd', '018'),
-STRUCT('AZ', 'hd', '009'), STRUCT('AZ', 'hd', '016'), STRUCT('AZ', 'sd', '016'),
+STRUCT('AZ', 'hd', '009'), STRUCT('AZ', 'hd', '016'), STRUCT('AZ', 'sd', '016'), STRUCT('AZ', 'sd', '017'),
 STRUCT('FL', 'sd', '021'), STRUCT('FL', 'sd', '036'),
 STRUCT('GA', 'hd', '128'), STRUCT('GA', 'sd', '048'),
 STRUCT('IA', 'hd', '022'),
@@ -804,7 +830,14 @@ FORMAT('%.1f', a.chamber_median_dem_share_2025 * 100) AS fmt_median_2025_pct,
 (a.chamber_median_dem_share_2030 - a.chamber_median_dem_share_2025)
 AS median_shift_2025_to_2030,
 -- Formatted district shift magnitude (for convergence decomposition)
-FORMAT('%.1f', ABS(a.delta_baseline_2030_vs_2025) * 100) AS fmt_district_shift_pts,
+    FORMAT('%.1f', ABS(a.delta_baseline_2030_vs_2025) * 100) AS fmt_district_shift_pts,
+
+    -- [v11.1 MIGRATION] Formatted migration magnitudes for sentence rendering.
+    -- Absolute values; sign/direction handled by CASE logic in migration CTE.
+    FORMAT('%.1f', ABS(COALESCE(a.migration_partisan_delta_pp, 0))) AS fmt_mig_partisan_abs,
+    FORMAT('%.1f', ABS(COALESCE(a.migration_nonwhite_delta_pp, 0))) AS fmt_mig_nonwhite_abs,
+    FORMAT('%.1f', ABS(COALESCE(a.migration_college_delta_pp, 0))) AS fmt_mig_college_abs,
+    FORMAT('%.1f', ABS(COALESCE(a.migration_age_delta_years, 0))) AS fmt_mig_age_abs,
 -- Volatility range (absolute distance from tipping point)
 FORMAT('%.1f', a.min_abs_margin_to_median_2030 * 100) AS fmt_closest_approach,
 FORMAT('%.1f', a.max_abs_margin_to_median_2030 * 100) AS fmt_farthest_margin,
@@ -1365,6 +1398,238 @@ FROM `proj-tmc-mem-fm.main.trends_2025_district_analytics`
 ) ranked
 GROUP BY state, chamber, district_number
 ),
+
+--======================================================================
+-- 3c. MIGRATION SENTENCE [v11.1 NEW]
+--
+-- Produces a single-sentence migration narrative per district by consuming
+-- the five migration_* fields from district_analytics and applying the
+-- branch logic workshopped with stakeholders:
+--
+-- Branch 1: Dominant factor fires. Special call-out phrasing naming the
+--           mechanism. Non-dominant compositional deltas above threshold
+--           are retained as "also" clauses.
+-- Branch 2: Partisan >= 0.25 pp, no dominance, >= 1 compositional above
+--           threshold. Listing format led by partisan.
+-- Branch 3: Partisan >= 0.25 pp, all compositional below threshold.
+--           Bare partisan sentence.
+-- Branch 4: Partisan < 0.25 pp, >= 1 compositional above threshold.
+--           Diagnostic branch — migration is reshaping composition but is
+--           not a partisan driver. Generic phrasing re: trend direction.
+-- Branch 5: All dimensions below threshold. NULL (sentence omitted).
+--
+-- Thresholds (match Step 1 internals):
+--   Partisan mention floor:      |Δ| >= 0.25 pp
+--   Nonwhite/college threshold:  |Δ| >= 2.0 pp
+--   Age threshold:               |Δ| >= 3.0 years
+--
+-- Districts with NULL in migration fields (zero in-movers) produce
+-- a NULL sentence and are handled by COALESCE at the call site.
+--======================================================================
+migration_sentence AS (
+  SELECT
+    c.state,
+    c.chamber,
+    c.district_number,
+
+    CASE
+      ----------------------------------------------------------------
+      -- Upstream NULL: Step 1 produced no migration row (no in-movers)
+      ----------------------------------------------------------------
+      WHEN c.migration_partisan_delta_pp IS NULL THEN NULL
+
+      ----------------------------------------------------------------
+      -- Branch 5: All dimensions below threshold. Omit.
+      ----------------------------------------------------------------
+      WHEN ABS(c.migration_partisan_delta_pp) < 0.25
+        AND ABS(COALESCE(c.migration_nonwhite_delta_pp, 0)) < 2.0
+        AND ABS(COALESCE(c.migration_college_delta_pp, 0)) < 2.0
+        AND ABS(COALESCE(c.migration_age_delta_years, 0)) < 3.0
+      THEN NULL
+
+      ----------------------------------------------------------------
+      -- Branch 4: Diagnostic — composition moves, partisan doesn't.
+      -- Generic phrasing re: trend direction (per workshop decision).
+      ----------------------------------------------------------------
+      WHEN ABS(c.migration_partisan_delta_pp) < 0.25 THEN CONCAT(
+        ' Migration is reshaping the electorate (',
+        -- Enumerate above-threshold compositional dimensions
+        ARRAY_TO_STRING(ARRAY(
+          SELECT s FROM UNNEST([
+            CASE WHEN ABS(c.migration_nonwhite_delta_pp) >= 2.0
+              THEN CONCAT(
+                'in-movers ', c.fmt_mig_nonwhite_abs,
+                ' pp ', CASE WHEN c.migration_nonwhite_delta_pp > 0
+                            THEN 'more' ELSE 'less' END,
+                ' nonwhite')
+              ELSE NULL END,
+            CASE WHEN ABS(c.migration_college_delta_pp) >= 2.0
+              THEN CONCAT(
+                c.fmt_mig_college_abs,
+                ' pp ', CASE WHEN c.migration_college_delta_pp > 0
+                            THEN 'more' ELSE 'less' END,
+                ' college-educated')
+              ELSE NULL END,
+            CASE WHEN ABS(c.migration_age_delta_years) >= 3.0
+              THEN CONCAT(
+                c.fmt_mig_age_abs,
+                ' years ', CASE WHEN c.migration_age_delta_years > 0
+                               THEN 'older' ELSE 'younger' END)
+              ELSE NULL END
+          ]) AS s WHERE s IS NOT NULL
+        ), ', '),
+        ') but is not a meaningful partisan driver - compositional ',
+        'change is not the mechanism producing the projected trend in ',
+        'this district.')
+
+      ----------------------------------------------------------------
+      -- Branch 1: Dominant factor fires.
+      -- Leads with dominance phrasing, then lists other above-threshold
+      -- compositional deltas as "also" clauses.
+      -- Note: the dominant dimension's own delta is NOT re-listed in
+      -- the "also" clause to avoid redundancy with the dominance text.
+      ----------------------------------------------------------------
+      WHEN c.migration_dominant_factor IS NOT NULL
+        AND ABS(c.migration_partisan_delta_pp) >= 0.5 THEN CONCAT(
+        ' Migration is pushing the district ',
+        c.fmt_mig_partisan_abs,
+        ' pp toward ',
+        CASE WHEN c.migration_partisan_delta_pp > 0
+          THEN 'Democrats'
+          ELSE 'Republicans'
+        END,
+        ' over the next five years, driven primarily by ',
+        -- Dominance phrasing map
+        CASE c.migration_dominant_factor
+          WHEN 'latino' THEN 'Latino in-migration'
+          WHEN 'black' THEN 'Black in-migration'
+          WHEN 'asian' THEN 'Asian in-migration'
+          WHEN 'natam' THEN 'Native American in-migration'
+          WHEN 'voters_of_color' THEN 'the racial composition of movers'
+          WHEN 'education' THEN
+            CASE WHEN c.migration_college_delta_pp > 0
+              THEN 'college-educated in-migration'
+              ELSE 'the loss of college-educated voters through out-migration'
+            END
+          WHEN 'age' THEN
+            CASE WHEN c.migration_age_delta_years > 0
+              THEN 'older in-movers'
+              ELSE 'younger in-movers'
+            END
+          ELSE 'compositional change'  -- defensive; should not hit
+        END,
+        -- "Also" clause: non-dominant compositional dims above threshold.
+        -- Suppress the dimension that IS the dominant factor (edu → college,
+        -- age → age) to avoid restating what dominance text already said.
+        -- Race sub-groups and voters_of_color don't map to the nonwhite
+        -- aggregate suppression — keep nonwhite visible in those cases.
+        CASE
+          WHEN (
+            -- Count "also" eligible dimensions after dominance suppression
+            CASE WHEN ABS(c.migration_nonwhite_delta_pp) >= 2.0
+              AND c.migration_dominant_factor NOT IN
+                ('latino','black','asian','natam','voters_of_color')
+              THEN 1 ELSE 0 END
+            + CASE WHEN ABS(c.migration_college_delta_pp) >= 2.0
+              AND c.migration_dominant_factor != 'education'
+              THEN 1 ELSE 0 END
+            + CASE WHEN ABS(c.migration_age_delta_years) >= 3.0
+              AND c.migration_dominant_factor != 'age'
+              THEN 1 ELSE 0 END
+          ) > 0
+          THEN CONCAT(
+            ' - in-movers are also ',
+            ARRAY_TO_STRING(ARRAY(
+              SELECT s FROM UNNEST([
+                CASE WHEN ABS(c.migration_nonwhite_delta_pp) >= 2.0
+                  AND c.migration_dominant_factor NOT IN
+                    ('latino','black','asian','natam','voters_of_color')
+                  THEN CONCAT(
+                    c.fmt_mig_nonwhite_abs,
+                    ' pp ', CASE WHEN c.migration_nonwhite_delta_pp > 0
+                                THEN 'more' ELSE 'less' END,
+                    ' nonwhite')
+                  ELSE NULL END,
+                CASE WHEN ABS(c.migration_college_delta_pp) >= 2.0
+                  AND c.migration_dominant_factor != 'education'
+                  THEN CONCAT(
+                    c.fmt_mig_college_abs,
+                    ' pp ', CASE WHEN c.migration_college_delta_pp > 0
+                                THEN 'more' ELSE 'less' END,
+                    ' college-educated')
+                  ELSE NULL END,
+                CASE WHEN ABS(c.migration_age_delta_years) >= 3.0
+                  AND c.migration_dominant_factor != 'age'
+                  THEN CONCAT(
+                    c.fmt_mig_age_abs,
+                    ' years ', CASE WHEN c.migration_age_delta_years > 0
+                                   THEN 'older' ELSE 'younger' END)
+                  ELSE NULL END
+              ]) AS s WHERE s IS NOT NULL
+            ), ' and '),
+            ' than out-movers.')
+          ELSE '.'
+        END)
+
+      ----------------------------------------------------------------
+      -- Branch 2: Partisan >= 0.25 pp, no dominance,
+      --           >= 1 compositional above threshold.
+      ----------------------------------------------------------------
+      WHEN ABS(c.migration_partisan_delta_pp) >= 0.25
+        AND (ABS(COALESCE(c.migration_nonwhite_delta_pp, 0)) >= 2.0
+          OR ABS(COALESCE(c.migration_college_delta_pp, 0)) >= 2.0
+          OR ABS(COALESCE(c.migration_age_delta_years, 0)) >= 3.0)
+        THEN CONCAT(
+        ' Migration is pushing the district ',
+        c.fmt_mig_partisan_abs, ' pp toward ',
+        CASE WHEN c.migration_partisan_delta_pp > 0
+          THEN 'Democrats' ELSE 'Republicans' END,
+        ' over the next five years; in-movers are ',
+        ARRAY_TO_STRING(ARRAY(
+          SELECT s FROM UNNEST([
+            CASE WHEN ABS(c.migration_nonwhite_delta_pp) >= 2.0
+              THEN CONCAT(
+                c.fmt_mig_nonwhite_abs,
+                ' pp ', CASE WHEN c.migration_nonwhite_delta_pp > 0
+                            THEN 'more' ELSE 'less' END,
+                ' nonwhite')
+              ELSE NULL END,
+            CASE WHEN ABS(c.migration_college_delta_pp) >= 2.0
+              THEN CONCAT(
+                c.fmt_mig_college_abs,
+                ' pp ', CASE WHEN c.migration_college_delta_pp > 0
+                            THEN 'more' ELSE 'less' END,
+                ' college-educated')
+              ELSE NULL END,
+            CASE WHEN ABS(c.migration_age_delta_years) >= 3.0
+              THEN CONCAT(
+                c.fmt_mig_age_abs,
+                ' years ', CASE WHEN c.migration_age_delta_years > 0
+                               THEN 'older' ELSE 'younger' END)
+              ELSE NULL END
+          ]) AS s WHERE s IS NOT NULL
+        ), ' and '),
+        ' than out-movers.')
+
+      ----------------------------------------------------------------
+      -- Branch 3: Partisan >= 0.25 pp, all compositional below threshold.
+      ----------------------------------------------------------------
+      WHEN ABS(c.migration_partisan_delta_pp) >= 0.25 THEN CONCAT(
+        ' Migration is pushing the district ',
+        c.fmt_mig_partisan_abs, ' pp toward ',
+        CASE WHEN c.migration_partisan_delta_pp > 0
+          THEN 'Democrats' ELSE 'Republicans' END,
+        ' over the next five years.')
+
+      ----------------------------------------------------------------
+      -- Defensive default
+      ----------------------------------------------------------------
+      ELSE NULL
+    END AS migration_sentence_text
+
+  FROM classified c
+),
+
 --======================================================================
 -- 4. EXPLANATION ASSEMBLY
 --
@@ -1471,6 +1736,8 @@ END
 -- "Safe D." or "Safe R." — margin detail adds no insight.
 ELSE CONCAT('Safe ', c.dem_or_rep_safe, '.')
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- Religion driver modifier (v4.1 REV #19; v6.0 REV #34 rewrite)
 -- [v6.0 REV #34] Religion modifier rewrite: index-based percentage.
 -- [v7.0 REV #47] Cohort overrepresentation sentence
@@ -1611,7 +1878,7 @@ THEN CONCAT(
 c.fmt_rank_dist, ' the district sits just outside the ',
 CAST(CAST(FLOOR(c.targeting_band) AS INT64) AS STRING),
 '-seat competitive band',
-' — only extreme scenarios push it into range.')
+' - only extreme scenarios push it into range.')
 -- Margin is the binding constraint: rank passes but margin outside
 WHEN c.rule_b_rank_met
 THEN CONCAT(
@@ -1656,6 +1923,8 @@ ELSE ''
 END
 )
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- Religion driver modifier (v4.1 REV #19; v6.0 REV #34 rewrite)
 -- [v6.0 REV #34] Religion modifier rewrite: index-based percentage.
 -- [v7.0 REV #47] Cohort overrepresentation sentence
@@ -1739,6 +2008,8 @@ ELSE CONCAT(
 'Dem share (', c.fmt_baseline_margin, ' points to the ',
 c.partisan_side, ' side) across all scenarios.')
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- Religion modifier (Section V)
 -- [v6.0 REV #34] Religion modifier rewrite: index-based percentage.
 -- [v7.0 REV #47] Cohort overrepresentation sentence
@@ -1891,6 +2162,8 @@ c.fmt_shift_pts, ' points by 2030, potentially making ',
 END
 ELSE ''
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- (7) Religion modifier (v4.1 REV #19; v6.0 REV #34 rewrite)
 -- [v6.0 REV #34] Religion modifier rewrite: index-based percentage.
 -- [v7.0 REV #47] Cohort overrepresentation sentence
@@ -2062,6 +2335,8 @@ c.fmt_shift_pts, ' points by 2030, potentially making ',
 END
 ELSE ''
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- (7) Religion modifier (v6.0 REV #34)
 -- [v7.0 REV #47] Cohort overrepresentation sentence
 COALESCE(cor.overrep_sentence, cor.statewide_avg_sentence, ''),
@@ -2248,7 +2523,7 @@ THEN CONCAT(
 'but at rank ', c.fmt_rank_dist,
 ' the district sits just outside the ',
 CAST(CAST(FLOOR(c.targeting_band) AS INT64) AS STRING),
-'-seat competitive band — a rank-boundary effect that ',
+'-seat competitive band - a rank-boundary effect that ',
 'sharply limits its tipping-point probability.')
 WHEN c.rule_b_rank_met
 THEN CONCAT(
@@ -2347,6 +2622,8 @@ c.fmt_shift_pts, ' points by 2030, potentially making ',
 END
 ELSE ''
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- (7) Religion modifier (v6.0 REV #34)
 -- [v7.0 REV #47] Cohort overrepresentation sentence
 COALESCE(cor.overrep_sentence, cor.statewide_avg_sentence, ''),
@@ -2541,7 +2818,7 @@ THEN CONCAT(
 'but at rank ', c.fmt_rank_dist,
 ' the district sits just outside the ',
 CAST(CAST(FLOOR(c.targeting_band) AS INT64) AS STRING),
-'-seat competitive band — a rank-boundary effect that ',
+'-seat competitive band - a rank-boundary effect that ',
 'sharply limits its tipping-point probability.')
 WHEN c.rule_b_rank_met
 THEN CONCAT(
@@ -2605,6 +2882,8 @@ c.fmt_shift_pts, ' points by 2030, potentially making ',
 END
 ))
 END,
+-- (6b) [v11.1] Migration sentence (from migration_sentence CTE)
+COALESCE(ms.migration_sentence_text, ''),
 -- (6) Religion modifier (v6.0 REV #34)
 -- [v7.0 REV #47] Cohort overrepresentation sentence
 COALESCE(cor.overrep_sentence, cor.statewide_avg_sentence, ''),
@@ -2627,9 +2906,14 @@ END
 ELSE 'Classification error: unrecognized primary category.'
 END AS tipping_point_explanation
 FROM classified c
--- [v7.0 REV #47] Join cohort overrepresentation for demographic sentences.
-LEFT JOIN cohort_overrepresentation cor
-USING (state, chamber, district_number)
+  LEFT JOIN cohort_overrepresentation cor
+    ON c.state = cor.state
+    AND c.chamber = cor.chamber
+    AND c.district_number = cor.district_number
+  LEFT JOIN migration_sentence ms
+    ON c.state = ms.state
+    AND c.chamber = ms.chamber
+    AND c.district_number = ms.district_number
 ),
 --======================================================================
 -- 5. FINAL OUTPUT
@@ -2729,7 +3013,11 @@ idx_mormon_vs_state,
 idx_jewish_vs_state,
 idx_natam_vs_state,
 idx_female_vs_state,
--- [v6.0 REV #30] Tipping-condition diagnostic fields (pass-through from Step 3)
+migration_partisan_delta_pp,
+migration_nonwhite_delta_pp,
+migration_college_delta_pp,
+migration_age_delta_years,
+migration_dominant_factor,
 tipping_scenario_count,
 non_tipping_scenario_count,
 -- Generated columns
