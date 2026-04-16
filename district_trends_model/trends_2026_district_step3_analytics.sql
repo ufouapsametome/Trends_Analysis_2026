@@ -1,6 +1,6 @@
 /*
   district_trends_2026_step3_analytics
-  v3.0
+  v3.1
   adapted from
   trends_2025_district_step5_analytics
   v1.4
@@ -15,6 +15,20 @@
   all scenarios), volatility, trend alignment, demographic driver ranking
   (weighted distinctive influence), lever exposure, scenario tipping profile,
   religion driver evaluation, and tipping condition drivers.
+
+v3.1 changes:
+  - NEW: Migration profile pass-through from Step 1. Adds 5 output
+    columns: migration_partisan_delta_pp, migration_nonwhite_delta_pp,
+    migration_college_delta_pp, migration_age_delta_years,
+    migration_dominant_factor.
+    These fields are computed in Step 1 v61.0 (new migration_profiles
+    export block) as per-district in-mover vs estimated-out-mover
+    demographic deltas plus a 65%-contribution dominance classification.
+    Step 3 performs no derivation on these fields; they are surfaced
+    for consumption by Step 4 explanation rendering.
+    Null for districts with zero in-movers (all-NULL row passed through).
+  - Added migration_profile_union CTE in Section 0.
+  - Added LEFT JOIN and 5 column pass-throughs in Section 9 assembly.
 
   v3.0 CHANGES (from v2.1):
   [REL #1] Added Mormon and Jewish religion indicators throughout, mirroring
@@ -65,6 +79,7 @@
     NH district/floterial xrefs
     TargetSmart voter file             (for raw demographic profiles + urbanicity)
     ACS natam correction, age imputation weights, state FIPS codes
+    migration_profiles_hd/_sd
 
   Output: district_analytics
 */
@@ -240,6 +255,16 @@ weighted_demo_union AS (
   SELECT *, 'hd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_weighted_demo_shares_hd`
   UNION ALL
   SELECT *, 'sd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_weighted_demo_shares_sd`
+),
+
+-- [v3.1] MIGRATION PROFILES: per-district in-mover vs out-mover deltas and
+-- dominance classification. Produced by Step 1 (v61.0) as side-outputs.
+-- Pass-through only: Step 3 does no derivation on these fields. Districts
+-- with zero in-movers have NULL values across all five columns.
+migration_profile_union AS (
+  SELECT *, 'hd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_migration_profiles_hd`
+  UNION ALL
+  SELECT *, 'sd' AS chamber FROM `proj-tmc-mem-fm.main.trends_2025_migration_profiles_sd`
 ),
 
 -- =====================================================================
@@ -1389,7 +1414,16 @@ assembled AS (
     du.pct_exurban,
     du.pct_rural,
     du.urbanicity_class,
-    du.urbanicity_purity
+    du.urbanicity_purity,
+
+    -- [v3.1] Migration profiles (from Step 1 side-output tables)
+    -- Pass-through fields; consumed by Step 4 to render migration
+    -- sentence. See Step 1 v61.0 changelog for computation details.
+    mp.migration_partisan_delta_pp,
+    mp.migration_nonwhite_delta_pp,
+    mp.migration_college_delta_pp,
+    mp.migration_age_delta_years,
+    mp.migration_dominant_factor
 
   FROM district_position dp
   JOIN tipping_union tp USING (state, chamber, district_number)
@@ -1404,6 +1438,7 @@ assembled AS (
   LEFT JOIN tipping_condition_drivers tcd USING (state, chamber, district_number)
   LEFT JOIN tipping_cohort_differential tdf USING (state, chamber, district_number)
   LEFT JOIN district_urbanicity du USING (state, chamber, district_number)
+  LEFT JOIN migration_profile_union mp USING (state, chamber, district_number)
 ),
 
 -- =====================================================================
